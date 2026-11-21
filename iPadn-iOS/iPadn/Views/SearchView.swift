@@ -8,9 +8,11 @@ struct SearchView: View {
     @EnvironmentObject private var apple: AppleService
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var confirmClear = false
-    @State private var getting: StoreApp?
     @State private var viewingFavorite: StoreApp?
     @State private var headerAway = false
+    @State private var searchCardWidth: CGFloat = 0
+    @State private var recentHeaderWidth: CGFloat = 0
+    @State private var recentFooterWidth: CGFloat = 0
     /// The common storefronts, in this order; names follow the interface language.
     private static let regions = ["CN", "US", "HK", "TW", "JP", "GB", "SG", "CA", "AU", "KR", "DE", "FR"]
     var body: some View {
@@ -21,6 +23,7 @@ struct SearchView: View {
                     .listRowInsets(EdgeInsets(top: 0, leading: 20, bottom: 2, trailing: 12))
                 SearchInput(text: $store.searchText, placeholder: "应用名称、App ID 或链接", capsule: true,
                             submit: { store.search() }, clear: { store.clearSearch() })
+                    .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { searchCardWidth = $0 }
                     .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 8) { regionPicker; platformPicker }
@@ -47,7 +50,9 @@ struct SearchView: View {
             }
             if !store.localResults.isEmpty {
                 Section {
-                    ForEach(store.localResults) { app in resultRow(app, note: nil) }
+                    ForEach(store.localResults.map(LocalSearchResultRow.init)) { item in
+                        resultRow(item.app, note: nil)
+                    }
                 } header: { Text("更多结果") }
             }
             if store.results.isEmpty && store.localResults.isEmpty && store.hasSearched && !store.searching && store.searchError == nil {
@@ -64,19 +69,30 @@ struct SearchView: View {
         .animation(UX.motion(reduceMotion), value: store.favorites.map(\.id))
         .toolPage()
         .rootTabBar("搜索", headerScrolledAway: headerAway)
-        .compatibleNavigationDestination(item: $getting) { app in AppDetailView(app: app, autoStart: true) }
         .compatibleNavigationDestination(item: $viewingFavorite) { app in AppDetailView(app: app) }
-        .actionConfirmation(isPresented: $confirmClear, title: "清除最近搜索？", confirmTitle: "清除") { withAnimation { store.clearHistory() } }
         .task { await store.loadNameCatalog() }
         .task { await store.checkWatched() }
-        .task(id: apple.activeID) { await store.ensureOwnedLoaded() }
+        .task { await store.ensureOwnedLoaded() }
+    }
+
+    /// Distinct section-scoped row identity prevents UICollectionView diffing
+    /// from ghosting duplicate cells when an app moves from local to remote results.
+    private struct LocalSearchResultRow: Identifiable {
+        let app: StoreApp
+        var id: String { "local:" + app.id }
     }
 
     private func resultRow(_ app: StoreApp, note: String?) -> some View {
         NavigationLink { AppDetailView(app: app) } label: {
             AppRow(app: app, subtitle: note.map { [app.displayCategory, $0].filter { !$0.isEmpty }.joined(separator: " · ") }) {
-                RowCapsule(title: "获取") { getting = app; UX.feedback() }
-                    .accessibilityLabel("获取 \(app.name)")
+                StoreDownloadActionButton(
+                    app: app,
+                    idleTitle: store.settings.store.platform.supportsIPA ? "获取" : "获取 PKG",
+                    filled: false,
+                    insideNavigationLink: true,
+                    alignment: .center,
+                    idleAccessibilityLabel: AppText.text("获取 \(app.name)")
+                )
             }
         }
         .contextMenu {
@@ -84,6 +100,16 @@ struct SearchView: View {
                 store.toggleFavorite(app); UX.feedback()
             }
         }
+    }
+
+    private var recentHeaderOutset: CGFloat {
+        guard searchCardWidth > recentHeaderWidth, recentHeaderWidth > 0 else { return 0 }
+        return (searchCardWidth - recentHeaderWidth) / 2
+    }
+
+    private var recentFooterOutset: CGFloat {
+        guard searchCardWidth > recentFooterWidth, recentFooterWidth > 0 else { return 0 }
+        return (searchCardWidth - recentFooterWidth) / 2
     }
 
     @ViewBuilder private var suggestions: some View {
@@ -102,18 +128,38 @@ struct SearchView: View {
                     }
                 }
                 .listRowBackground(Color.clear)
-                // A transparent inset-grouped cell still has a rounded mask.
-                // Keep each capsule inside it, aligned with the section text,
-                // so the first/last wrapped rows retain their own round ends.
-                .listRowInsets(EdgeInsets(top: 2, leading: 16, bottom: 2, trailing: 16))
+                // Flush with the SearchInput outer edges (leading/trailing = 0).
+                // Vertical 7pt margin keeps every 38pt capsule (r = 19pt) inside
+                // the transparent cell's corner mask without clipping its ends.
+                .listRowInsets(EdgeInsets(top: 7, leading: 0, bottom: 7, trailing: 0))
             } header: {
-                HStack {
-                    Text("最近搜索").font(.title3.weight(.bold)).foregroundStyle(.primary).textCase(nil)
-                    Spacer()
-                    Button("清除") { confirmClear = true }.font(.body).textCase(nil)
+                VStack(spacing: 0) {
+                    Color.clear.frame(height: 0)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { recentHeaderWidth = $0 }
+                    HStack(alignment: .firstTextBaseline, spacing: 12) {
+                        Text("最近搜索").font(.title3.weight(.bold)).foregroundStyle(.primary).textCase(nil)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                        Button("清除") { confirmClear = true }
+                            .font(.body)
+                            .textCase(nil)
+                            .fixedSize()
+                            .confirmationDialog("清除最近搜索？", isPresented: $confirmClear, titleVisibility: .visible) {
+                                Button("清除", role: .destructive) { withAnimation(UX.motion(reduceMotion)) { store.clearHistory() } }
+                                Button("取消", role: .cancel) {}
+                            }
+                    }
+                    .padding(.horizontal, -recentHeaderOutset)
                 }
             } footer: {
-                Text("长按可删除单条记录。")
+                VStack(alignment: .leading, spacing: 0) {
+                    Color.clear.frame(height: 0)
+                        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { recentFooterWidth = $0 }
+                    Text("长按可删除单条记录。")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.horizontal, -recentFooterOutset)
+                }
             }
         }
         if !store.favorites.isEmpty {
@@ -127,7 +173,7 @@ struct SearchView: View {
                     }
                         .buttonStyle(RevealRowButtonStyle())
                         .accessibilityIdentifier("favorite." + app.id)
-                        .revealDelete(id: "favorite." + app.id, title: "取消关注") { withAnimation { store.toggleFavorite(app) } }
+                        .revealDelete(id: "favorite." + app.id, title: "取消关注", fills: true) { withAnimation { store.toggleFavorite(app) } }
                 }
             } header: {
                 HStack {
@@ -179,13 +225,25 @@ struct AccountMenuButton: View {
             if !apple.accounts.isEmpty {
                 Section("切换账号") {
                     ForEach(apple.accounts) { account in
-                        Button { apple.select(account.id); UX.feedback() } label: {
-                            Label(account.id, systemImage: account.id == apple.activeID ? "checkmark.circle.fill" : "person.crop.circle")
+                        Button {
+                            if account.needsReauthentication {
+                                store.selectTab(.accounts)
+                                UX.feedback()
+                            } else {
+                                apple.select(account.id)
+                                UX.feedback()
+                            }
+                        } label: {
+                            if account.needsReauthentication {
+                                Label("\(account.id)（需重新登录）", systemImage: "person.crop.circle.badge.exclamationmark")
+                            } else {
+                                Label(account.id, systemImage: account.id == apple.activeID ? "checkmark.circle.fill" : "person.crop.circle")
+                            }
                         }
                     }
                 }
             }
-            Button("账号与设置", systemImage: "person.crop.circle") { store.tab = 3 }
+            Button("账号与设置", systemImage: "person.crop.circle") { store.selectTab(.accounts) }
         } label: {
             AccountAvatar(account: apple.active, size: 32).frame(minWidth: 44, minHeight: 44)
         }
@@ -203,12 +261,16 @@ struct AccountAvatar: View {
     }
     var body: some View {
         ZStack {
-            Circle().fill(account == nil ? AnyShapeStyle(Color(.tertiarySystemFill))
-                          : AnyShapeStyle(LinearGradient(colors: [Color(.systemGray2), Color(.systemGray)], startPoint: .top, endPoint: .bottom)))
             if account == nil {
+                Circle().fill(Color(.tertiarySystemFill))
                 Image(systemName: "person.fill").font(.system(size: size * 0.5)).foregroundStyle(.secondary)
             } else {
-                Text(initials).font(.system(size: size * 0.45, weight: .semibold, design: .rounded)).foregroundStyle(.white)
+                Circle().fill(LinearGradient(colors: [Color(.systemGray2), Color(.systemGray)],
+                                             startPoint: .top, endPoint: .bottom))
+                Text(initials)
+                    .font(.system(size: size * 0.45, weight: .semibold, design: .rounded))
+                    .foregroundStyle(.white)
+                    .contentTransition(.opacity)
             }
         }
         .frame(width: size, height: size)

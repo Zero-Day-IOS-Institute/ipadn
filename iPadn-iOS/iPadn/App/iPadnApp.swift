@@ -23,12 +23,24 @@ enum AppContainer {
             if ProcessInfo.processInfo.arguments.contains("--completion-preview") {
                 jobs = [jobs[0]]
             }
-            let store = ToolStore(downloadManager: DownloadManager(previewJobs: jobs))
+            let verifiesInteractions = ProcessInfo.processInfo.arguments.contains("--interaction-verification")
+            var fixtureError: String?
+            if verifiesInteractions {
+                do { jobs = try PreviewData.interactionVerificationJobs() }
+                catch { jobs = []; fixtureError = error.localizedDescription }
+            }
+            let manager = verifiesInteractions
+                ? DownloadManager(previewJobs: jobs, saveJobs: { try LocalResources.save($0, filename: LocalResources.jobsFilename) })
+                : DownloadManager(previewJobs: jobs)
+            let store = ToolStore(downloadManager: manager)
             store.prepareVisualPreview()
+            if verifiesInteractions {
+                store.errorMessage = fixtureError
+            }
             store.settings.appearance = ProcessInfo.processInfo.arguments.contains("--dark") ? "dark" : "light"
-            if ProcessInfo.processInfo.arguments.contains("--downloads") { store.tab = 1 }
-            if ProcessInfo.processInfo.arguments.contains("--accounts") { store.prepareAccountPreview(); store.tab = 3 }
-            if ProcessInfo.processInfo.arguments.contains("--purchased") { store.prepareAccountPreview(); store.tab = 2 }
+            if ProcessInfo.processInfo.arguments.contains("--downloads") { store.selectTab(.downloads) }
+            if ProcessInfo.processInfo.arguments.contains("--accounts") { store.prepareAccountPreview(); store.selectTab(.accounts) }
+            if ProcessInfo.processInfo.arguments.contains("--purchased") { store.prepareAccountPreview(); store.selectTab(.purchased) }
             if ProcessInfo.processInfo.arguments.contains("--archive") { store.prepareArchivePreview() }
             if ProcessInfo.processInfo.arguments.contains("--notice-preview") { store.infoMessage = "已复制到剪贴板" }
             return store
@@ -42,6 +54,23 @@ final class AppDelegate: NSObject, UIApplicationDelegate {
     func application(_ application: UIApplication,
                      didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
         if !LocalResources.isPreview { UpdateCheckScheduler.register() }
+        #if DEBUG
+        // FairPlay research build: headless lab, see FairPlayLab.swift.
+        // Debug only: a Release build must contain no research launch switches.
+        if FairPlayLab.handleLaunchIfRequested() {
+            return true
+        }
+        FairPlayLab.handleUITestLaunch(store: AppContainer.shared)
+        // Read-only navigation/accessibility probe over real on-device data.
+        // No fixture tasks or synthetic results enter the product UI.
+        if CommandLine.arguments.contains("--fp-ux") {
+            let store = AppContainer.shared
+            store.settings.proMode = true
+            store.selectTab(.packages)
+            if CommandLine.arguments.contains("--ux-dark") { store.settings.appearance = "dark" }
+            if CommandLine.arguments.contains("--ux-light") { store.settings.appearance = "light" }
+        }
+        #endif
         #if DEBUG
         // Device tests: open an iPadn link at launch, e.g. --open-url=ipadn://download?url=…
         if let argument = ProcessInfo.processInfo.arguments.first(where: { $0.hasPrefix("--open-url=") }),
@@ -86,6 +115,7 @@ struct iPadnApp: App {
     var body: some Scene {
         WindowGroup {
             appContent
+                .modifier(FairPlayAccessibilityProbe())
                 .environmentObject(store)
                 .environmentObject(store.tabs)
                 .environmentObject(store.apple)
@@ -93,14 +123,25 @@ struct iPadnApp: App {
                 .environmentObject(store.signer)
                 .tint(UX.tint)
                 .toggleStyle(TintedSwitchToggleStyle())
-                .onOpenURL { store.handleURL($0) }
-                .onAppear { configureLock(launching: true) }
-                .task { if !LocalResources.isPreview { await AppLock.shared.unlock() } }
+                .onOpenURL { store.receiveExternalURL($0) }
+                .onAppear {
+                    configureLock(launching: true)
+                    TemporaryExportSweeper.sweepStaleFiles()
+                }
+                .task {
+                    if !LocalResources.isPreview { await AppLock.shared.unlock() }
+                    if !AppLock.shared.locked { store.flushPendingExternalURL() }
+                }
                 .compatibleOnChange(of: lockSettings) { _ in configureLock(launching: false) }
                 // @Published sends before the value changes: look once it has.
                 .onReceive(store.downloads.$pendingAutoInstalls) { _ in AutoInstall.presentSoon(store) }
                 .onReceive(store.downloads.$autoInstallNotice) { notice in if let notice { store.infoMessage = notice } }
-                .onReceive(AppLock.shared.$locked) { locked in if !locked { AutoInstall.presentSoon(store) } }
+                .onReceive(AppLock.shared.$locked) { locked in
+                    if !locked {
+                        store.flushPendingExternalURL()
+                        AutoInstall.presentSoon(store)
+                    }
+                }
                 .task {
                     guard !LocalResources.isPreview, store.settings.appUpdateCheck else { return }
                     await store.checkAppUpdate()
@@ -108,8 +149,18 @@ struct iPadnApp: App {
         }
         .onChange(of: scenePhase) { phase in
             if !LocalResources.isPreview { AppLock.shared.sceneChanged(to: phase) }
-            if phase == .active { store.downloads.resumeAutoInstalls(); AutoInstall.presentNext(store) }
+            if phase == .active {
+                ManifestBuilder.invalidateLoopbackHostCache()
+                RemotePairingPort.invalidateCache()
+                store.downloads.resumeAutoInstalls()
+                AutoInstall.presentNext(store)
+                DownloadActivity.shared.sync()
+                if !LocalResources.isPreview, store.settings.appUpdateCheck {
+                    Task { await store.checkAppUpdate() }
+                }
+            }
             guard phase == .background, !LocalResources.isPreview else { return }
+            TemporaryExportSweeper.sweepStaleFiles(maxAge: 900)
             // Session cookies kept in memory must survive the app being closed.
             store.apple.saveLiveCookies()
             // Only worth waking up for when there is something to check.
@@ -120,6 +171,17 @@ struct iPadnApp: App {
                 UpdateCheckScheduler.cancel()
             }
         }
+    }
+}
+
+private struct FairPlayAccessibilityProbe: ViewModifier {
+    func body(content: Content) -> some View {
+        #if DEBUG
+        if CommandLine.arguments.contains("--ux-large") { content.dynamicTypeSize(.accessibility5) }
+        else { content }
+        #else
+        content
+        #endif
     }
 }
 
@@ -149,7 +211,44 @@ enum PreviewData {
         zip(apps.prefix(3), ["363590051", "324684580", "1232780281"]).map { app, id in var app = app; app.id = id; return app }
     }
     /// The followed app; UI tests find it by this identifier.
-    static var favorite: StoreApp { var app = apps[0]; app.id = "preview-app"; return app }
+    static var favorite: StoreApp {
+        var app = apps[0]; app.id = "preview-app"
+        if ProcessInfo.processInfo.arguments.contains("--interaction-verification") || ProcessInfo.processInfo.arguments.contains("--translation-preview") {
+            app.name = "翻译验证（隔离文本）"
+            app.description = "This app helps you organize your notes and keep your documents in one place. You can search your files and share them with your team."
+            app.iconURL = nil
+        }
+        return app
+    }
+    /// Device verification only: actual bytes and durable saves, exclusively
+    /// under the existing preview sandbox. Never used by a normal app launch.
+    static func interactionVerificationJobs() throws -> [DownloadJob] {
+        precondition(LocalResources.isPreview)
+        LocalResources.ensureDirectoriesExist()
+        let existing = (try? FileManager.default.contentsOfDirectory(
+            at: LocalResources.packages, includingPropertiesForKeys: nil
+        )) ?? []
+        for url in existing where url.lastPathComponent.hasPrefix("Interaction-Probe-") && url.pathExtension == "ipa" {
+            try? FileManager.default.removeItem(at: url)
+        }
+        var jobs: [DownloadJob] = []
+        var files: [[String: String]] = []
+        for (index, letter) in ["A", "B"].enumerated() {
+            let name = "Interaction-Probe-\(letter)-\(UUID().uuidString).ipa"
+            let bytes = Data((0..<8192).map { UInt8(($0 + index) % 251) })
+            try bytes.write(to: LocalResources.packages.appendingPathComponent(name), options: .atomic)
+            let job = DownloadJob(app: StoreApp(id: "verification-\(letter)", name: "撤销测试 \(letter)（隔离数据）", version: "1.0"),
+                status: .completed, downloaded: Int64(bytes.count), expected: Int64(bytes.count),
+                packageIconScanned: true, localFilename: name)
+            jobs.append(job)
+            files.append(["id": job.id.uuidString, "filename": name, "patternOffset": String(index)])
+        }
+        jobs.append(DownloadJob(app: StoreApp(id: "verification-C", name: "撤销测试 C（无文件）", version: "1.0"), status: .paused))
+        try LocalResources.save(jobs, filename: LocalResources.jobsFilename)
+        let manifest = try JSONSerialization.data(withJSONObject: ["files": files], options: .sortedKeys)
+        try manifest.write(to: LocalResources.support.appendingPathComponent("interaction-verification-manifest.json"), options: .atomic)
+        return jobs
+    }
     static var chinese: Bool { Locale.preferredLanguages.first?.hasPrefix("zh") == true }
 }
 
@@ -159,6 +258,7 @@ private struct PreviewScreen: View {
     var body: some View {
         Group {
             if args.contains("--login") { NavigationStack { LoginView() } }
+            else if args.contains("--translation-settings") { NavigationStack { SettingsView(page: .appearance).accountNavigationDestinations() } }
             else if args.contains("--detail"), let app = store.favorites.first { NavigationStack { AppDetailView(app: app) } }
             else if args.contains("--installation") { NavigationStack { InstallationSettingsView() } }
             else if args.contains("--support") { NavigationStack { SupportView() } }

@@ -6,7 +6,7 @@ import UserNotifications
 struct SettingsView: View {
     /// Settings are grouped into pages, like the system's Settings app, so
     /// the first screen stays short.
-    enum Page {
+    enum Page: String, Hashable, Codable {
         case root, downloads, follow, appearance, lock, sources, maintenance
         var title: LocalizedStringKey {
             switch self {
@@ -27,13 +27,21 @@ struct SettingsView: View {
     @StateObject private var icons = AppIconService()
     @State private var iconIssue: String?
     @State private var addingSource = false
-    @State private var editingSourceID: UUID?
     /// Results of the last "check all sources", by source.
     @State private var sourceChecks: [UUID: SourceCheckState] = [:]
     @State private var share: SharedFile?
+    @State private var presentedShareURL: URL?
     @State private var resetSettings = false
+    @State private var exportingBackupSheet = false
+    @State private var pendingExportURL: URL?
     @State private var importingBackup = false
+    @State private var deferredBackupImport: Result<BackupInspectResult, Error>?
     @State private var pendingBackup: Data?
+    @State private var encryptedBackupItem: EncryptedBackupItem?
+    @State private var pendingDecryptedPreview: UnifiedBackupPreview?
+    @State private var backupPreview: UnifiedBackupPreview?
+    @State private var backupConflictPolicy: AccountBackupConflictPolicy = .skipExisting
+    @State private var restoreDeviceIdentity = true
     @State private var clearCache = false
     /// The appearance the home screen icon has: fixed by the icon theme, or the
     /// system's (not iPadn's own appearance setting) when following the system.
@@ -45,10 +53,11 @@ struct SettingsView: View {
         }
     }
     private func pageLink(_ page: Page, _ symbol: String, _ identifier: String) -> some View {
-        NavigationLink { SettingsView(page: page) } label: { Label(page.title, systemImage: symbol) }
+        NavigationLink(value: AccountRoute.settings(page)) { Label(page.title, systemImage: symbol) }
             .accessibilityIdentifier(identifier)
     }
     var body: some View {
+        ScrollViewReader { reader in
         Form {
             if page == .root {
             Section {
@@ -57,7 +66,7 @@ struct SettingsView: View {
                 pageLink(.appearance, "paintbrush", "settings.page.appearance")
                 pageLink(.lock, "lock", "settings.page.lock")
                 pageLink(.sources, "clock.arrow.circlepath", "settings.page.sources")
-                NavigationLink { InstallationSettingsView() } label: { Label("安装设置", systemImage: "arrow.down.app") }
+                NavigationLink(value: AccountRoute.installation) { Label("安装设置", systemImage: "arrow.down.app") }
                     .accessibilityIdentifier("settings.installation")
                 pageLink(.maintenance, "wrench.and.screwdriver", "settings.page.maintenance")
             }
@@ -83,6 +92,8 @@ struct SettingsView: View {
                 .accessibilityIdentifier("settings.auto-install")
                 Toggle("实时活动显示下载进度", isOn: $store.settings.downloadLiveActivity)
                     .accessibilityIdentifier("settings.download-activity")
+                Toggle("搜索时优先显示已下架应用", isOn: $store.settings.prioritizeDelistedSearchResults)
+                    .accessibilityIdentifier("settings.prioritize-delisted-search")
                 Toggle("兼容下载模式", isOn: $store.settings.compatibleDownloadMode)
                 if store.downloads.backgroundDownloadsUnavailable && !store.settings.compatibleDownloadMode {
                     Button(AppText.text("重新尝试后台下载")) { store.downloads.retryBackgroundDownloads(); store.infoMessage = AppText.text("下一个下载任务会重新尝试后台下载") }
@@ -94,6 +105,7 @@ struct SettingsView: View {
                     Text("关闭「新版本提醒」后，下载页不再显示新版本提示，也不发送通知。")
                     Text("开启「仅使用 Wi‑Fi 下载」后，只有蜂窝数据时下载会暂停排队，连上 Wi‑Fi 后自动继续。「下载完成后自动安装」使用原生安装时会在后台直接安装，不需要确认（LocalDevVPN 需保持连接）；其他安装方式会在 iPadn 打开时弹出安装。")
                     Text("下载时在锁定屏幕和灵动岛显示进度。iPadn 在后台时按测得的速度估算进度，回到 iPadn 后更新为实际进度。")
+                    Text("开启「搜索时优先显示已下架应用」后，关键词搜索会优先将已确认下架并匹配关键词的应用排在结果前排；关闭后恢复原有搜索排序。")
                     if store.downloads.backgroundDownloadsUnavailable && !store.settings.compatibleDownloadMode {
                         Text("当前签名下系统后台下载无法保存文件，已自动改用应用内下载，下载时请保持 iPadn 在前台。更换签名后可以点按「重新尝试后台下载」。")
                     } else {
@@ -147,14 +159,25 @@ struct SettingsView: View {
             }
             }
             if page == .appearance {
-            Section("搜索与外观") {
+            Section {
                 Picker("搜索结果数量", selection: $store.settings.searchLimit) {
                     ForEach([10, 30, 50, 100, 200], id: \.self) { Text("\($0)").tag($0) }
                 }
                 Toggle("在搜索页显示「发现」", isOn: $store.settings.showDiscover.animation())
                     .accessibilityIdentifier("settings.show-discover")
+                Toggle("显示应用预览图", isOn: $store.settings.showAppScreenshots.animation())
+                    .accessibilityIdentifier("settings.show-screenshots")
+                Toggle("显示应用评论", isOn: $store.settings.showAppReviews.animation())
+                    .accessibilityIdentifier("settings.show-reviews")
+                Toggle("显示历史版本图标", isOn: $store.settings.showHistoryIcons)
+                    .accessibilityIdentifier("settings.history-icons")
                 Picker("外观", selection: $store.settings.appearance) {
                     Text("跟随系统").tag("system"); Text("浅色").tag("light"); Text("深色").tag("dark")
+                }
+            } header: { Text("搜索与外观") } footer: {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("关闭后，应用详情页将隐藏预览图或评论区块并停止请求对应额外资源，应用基本信息与开发者信息不受影响。")
+                    Text("关闭「显示历史版本图标」可跳过读取历史版本图标以节省流量和加载时间；已缓存的图标文件仍会保留。")
                 }
             }
             Section {
@@ -205,24 +228,24 @@ struct SettingsView: View {
                     Text("默认使用深色图标。「跟随系统」会随主屏幕的浅色、深色和着色外观切换（iOS 18 及更新版本），也可以固定使用浅色图标。")
                 }
             }
+            TranslationSettingsSections()
             }
             if page == .sources {
             ForEach($store.settings.versionSources) { $source in
                 Section {
-                    Button { editingSourceID = source.id } label: {
+                    NavigationLink(value: AccountRoute.versionSource(source.id)) {
                         HStack {
                             VStack(alignment: .leading, spacing: 4) {
-                                Text(source.name)
+                                Text(source.name).foregroundStyle(.primary)
                                 Text(source.urlTemplate).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                                 if let check = sourceChecks[source.id] { SourceCheckLabel(state: check) }
                             }
                             Spacer()
                             Text(source.enabled ? "已启用" : "已停用").font(.caption).foregroundStyle(.secondary)
-                            Image(systemName: "chevron.forward").font(.footnote.weight(.semibold)).foregroundStyle(.tertiary)
                         }
                     }
                     .accessibilityIdentifier("settings.source." + source.name)
-                    .revealDelete(id: "source." + source.id.uuidString, title: "移除") {
+                    .revealDelete(id: "source." + source.id.uuidString, title: "移除", fills: true) {
                         let id = source.id
                         withAnimation { store.settings.versionSources.removeAll { $0.id == id } }
                     }
@@ -253,32 +276,46 @@ struct SettingsView: View {
             }
             if page == .root {
             Section {
-                Toggle("专业模式", isOn: $store.settings.proMode.animation())
+                Toggle("专业模式", isOn: $store.settings.proMode)
                     .accessibilityIdentifier("settings.pro-mode")
                 if store.settings.proMode {
-                    NavigationLink { CredentialsView() } label: { Label("账号与设备标识", systemImage: "key") }
+                    NavigationLink(value: AccountRoute.credentials) { Label("账号与设备标识", systemImage: "key") }
                         .accessibilityIdentifier("settings.credentials")
                 }
             } footer: {
-                Text(store.settings.proMode ? "可以在下载任务详情中浏览安装包内容，并查看账号令牌和设备标识。"
-                     : "打开后可以浏览安装包内容、查看账号令牌和修改设备标识。")
+                Text(store.settings.proMode
+                     ? "可以在下载任务详情中浏览安装包内容、查看账号令牌和设备标识，并在「应用包」页对 IPA 发起 FairPlay 解密与导出。"
+                     : "打开后可以浏览安装包内容、查看账号令牌、修改设备标识，并启用「应用包」解密功能。")
             }
             }
             if page == .maintenance {
             Section {
-                Button("导出设置与关注") {
-                    do { share = SharedFile(url: try store.exportBackup()) } catch { store.errorMessage = error.localizedDescription }
+                Button {
+                    exportingBackupSheet = true
+                    UX.feedback()
+                } label: {
+                    Label("导出备份", systemImage: "square.and.arrow.up")
                 }
                 .accessibilityIdentifier("settings.export-backup")
-                Button("导入设置与关注") { importingBackup = true }
-                    .accessibilityIdentifier("settings.import-backup")
+                Button {
+                    importingBackup = true
+                } label: {
+                    Label("导入备份", systemImage: "square.and.arrow.down")
+                }
+                .accessibilityIdentifier("settings.import-backup")
             } header: { Text("备份") } footer: {
-                Text("包含设置、版本来源、关注的应用及价格记录和最近搜索，不包含账号和已下载的安装包。换签名方式或换设备前导出，之后导入即可恢复。")
+                Text("导出或恢复应用设置、版本来源、关注与应用记录、最近搜索，以及全部 Apple 账号资料、Cookie、登录令牌、密码与设备凭证。导出时可设置密码加密或直接明文导出，不包含已下载的安装包。")
             }
             Section("维护") {
-                NavigationLink { StorageView() } label: { Label("存储空间", systemImage: "internaldrive") }
+                NavigationLink(value: AccountRoute.storage) { Label("存储空间", systemImage: "internaldrive") }
                     .accessibilityIdentifier("settings.storage")
                 Button("清除历史版本缓存") { clearCache = true }
+                    .confirmationDialog("清除历史版本缓存？", isPresented: $clearCache, titleVisibility: .visible) {
+                        Button("清除缓存", role: .destructive) {
+                            Task { do { try await store.clearVersionCaches(); store.infoMessage = AppText.text("已清除缓存") } catch { store.errorMessage = error.localizedDescription } }
+                        }
+                        Button("取消", role: .cancel) {}
+                    }
                 Button("导出诊断信息") {
                     do { share = SharedFile(url: try store.exportDiagnostics()) } catch { store.errorMessage = error.localizedDescription }
                 }
@@ -309,7 +346,7 @@ struct SettingsView: View {
                 .padding(.vertical, 2)
                 .accessibilityElement(children: .combine)
                 if let update = store.appUpdate {
-                    NavigationLink { AppUpdateView(release: update) } label: {
+                    NavigationLink(value: AccountRoute.appUpdate) {
                         Label("iPadn \(update.version) 可以更新", systemImage: "arrow.down.app.fill")
                             .foregroundStyle(.tint).fontWeight(.semibold)
                     }
@@ -319,7 +356,8 @@ struct SettingsView: View {
                     Task {
                         let reached = await store.checkAppUpdate(force: true)
                         if !reached { store.errorMessage = AppText.text("暂时无法检查更新，请稍后重试。") }
-                        else if store.appUpdate == nil { store.infoMessage = AppText.text("已是最新版本") }
+                        else if store.appUpdate != nil { store.accountNav.push(.appUpdate) }
+                        else { store.infoMessage = AppText.text("已是最新版本") }
                     }
                 } label: {
                     HStack {
@@ -331,15 +369,29 @@ struct SettingsView: View {
                 .disabled(store.appUpdateChecking)
                 Toggle("自动检查更新", isOn: $store.settings.appUpdateCheck)
                     .compatibleOnChange(of: store.settings.appUpdateCheck) { on in
-                        if on { UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in } }
+                        if on {
+                            UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
+                            Task { await store.checkAppUpdate() }
+                        }
                     }
-                Link("项目与更新", destination: URL(string: "https://github.com/mengangs/ipadn")!)
+                Link("项目与更新", destination: SupportLinks.releases)
             }
             Section {
-                NavigationLink { SupportView() } label: { SupportRow() }
+                NavigationLink(value: AccountRoute.support) { SupportRow() }
                     .accessibilityIdentifier("settings.support")
+                Link(destination: SupportLinks.telegram) { TelegramChannelRow() }
+                    .accessibilityIdentifier("settings.telegram")
             }
             }
+        }
+        .compatibleOnChange(of: store.settings.directTranslation) { on in
+            guard on, page == .appearance else { return }
+            Task { @MainActor in
+                try? await Task.sleep(for: .milliseconds(150))
+                guard store.settings.directTranslation else { return }
+                withAnimation { reader.scrollTo("settings.translation.resources", anchor: .bottom) }
+            }
+        }
         }
         .toolPage().navigationTitle(page.title).navigationBarTitleDisplayMode(.inline)
         .compatibleOnChange(of: scenePhase) { phase in if phase == .active { icons.refresh() } }
@@ -347,15 +399,74 @@ struct SettingsView: View {
             Button("知道了", role: .cancel) { iconIssue = nil }
         } message: { Text(iconIssue ?? "") }
         .sheet(isPresented: $addingSource) { AddVersionSourceView() }
+        .sheet(isPresented: $exportingBackupSheet, onDismiss: {
+            if let url = pendingExportURL {
+                pendingExportURL = nil
+                share = SharedFile(url: url)
+            }
+        }) {
+            BackupExportSheet(
+                accountCount: store.apple.accounts.count,
+                signedInCount: store.apple.accounts.filter(\.hasValidSession).count,
+                deviceGUID: store.apple.guid,
+                onExport: { password in
+                    try store.exportBackup(password: password)
+                },
+                onPreparedFile: { url in
+                    pendingExportURL = url
+                    exportingBackupSheet = false
+                },
+                onCancel: {
+                    if let url = pendingExportURL {
+                        try? FileManager.default.removeItem(at: url)
+                        pendingExportURL = nil
+                    }
+                    exportingBackupSheet = false
+                }
+            )
+        }
         .fileImporter(isPresented: $importingBackup, allowedContentTypes: [.json, .data]) { result in
-            guard case .success(let url) = result else { return }
+            guard case .success(let url) = result else {
+                if case .failure(let error) = result {
+                    deferredBackupImport = .failure(error)
+                    scheduleBackupImportPresentation()
+                }
+                return
+            }
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
             do {
+                if let fileSize = try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize,
+                   fileSize > AccountProfileBackup.maxImportBytes {
+                    throw AccountBackupError.fileTooLarge
+                }
                 let data = try Data(contentsOf: url)
-                _ = try AppBackup.decode(data)
-                pendingBackup = data
-            } catch { store.errorMessage = error.localizedDescription }
+                deferredBackupImport = .success(try store.previewBackup(data: data))
+            } catch {
+                deferredBackupImport = .failure(error)
+            }
+            scheduleBackupImportPresentation()
+        }
+        .compatibleOnChange(of: importingBackup) { isImporting in
+            if !isImporting { scheduleBackupImportPresentation() }
+        }
+        .sheet(item: $encryptedBackupItem, onDismiss: {
+            if let preview = pendingDecryptedPreview {
+                pendingDecryptedPreview = nil
+                presentImportPreview(preview)
+            }
+        }) { item in
+            EncryptedBackupPasswordSheet(
+                onUnlock: { password in
+                    let preview = try store.decryptAndPreviewBackup(data: item.data, password: password)
+                    pendingDecryptedPreview = preview
+                    encryptedBackupItem = nil
+                },
+                onCancel: {
+                    pendingDecryptedPreview = nil
+                    encryptedBackupItem = nil
+                }
+            )
         }
         .actionConfirmation(isPresented: Binding(get: { pendingBackup != nil }, set: { if !$0 { pendingBackup = nil } }),
                             title: "导入这个备份？", message: "当前设置会被备份中的设置替换，关注的应用会合并。账号和已下载的安装包不受影响。",
@@ -363,20 +474,94 @@ struct SettingsView: View {
             guard let data = pendingBackup else { return }
             Task { do { try await store.importBackup(data) } catch { store.errorMessage = error.localizedDescription } }
         }
-        .compatibleNavigationDestination(item: $editingSourceID) { id in
-            if let index = store.settings.versionSources.firstIndex(where: { $0.id == id }) {
-                VersionSourceEditor(source: $store.settings.versionSources[index])
-            }
+        .sheet(item: Binding(
+            get: { backupPreview.map { BackupPreviewSheetItem(preview: $0) } },
+            set: { if $0 == nil { backupPreview = nil } }
+        )) { item in
+            UnifiedBackupImportSheet(
+                preview: item.preview,
+                existingAccounts: store.apple.accounts,
+                policy: $backupConflictPolicy,
+                restoreDeviceIdentity: $restoreDeviceIdentity,
+                onConfirm: {
+                    let data = item.preview.data
+                    let policy = backupConflictPolicy
+                    let restoreGUID = restoreDeviceIdentity
+                    backupPreview = nil
+                    Task {
+                        do {
+                            try await store.importBackup(
+                                data,
+                                accountPolicy: policy,
+                                restoreDeviceIdentity: restoreGUID
+                            )
+                            UX.success()
+                        } catch {
+                            store.errorMessage = error.localizedDescription
+                        }
+                    }
+                },
+                onCancel: { backupPreview = nil }
+            )
         }
-        .sheet(item: $share) { file in ShareSheet(items: [file.url]) }
-        .actionConfirmation(isPresented: $resetSettings, title: "恢复默认设置？", message: "账号、已下载的安装包和已购记录不受影响。", confirmTitle: "恢复默认设置") { store.settings = ToolSettings() }
-        .actionConfirmation(isPresented: $clearCache, title: "清除历史版本缓存？", confirmTitle: "清除缓存") {
-            Task { do { try await store.versions.clearCache(); store.infoMessage = AppText.text("已清除缓存") } catch { store.errorMessage = error.localizedDescription } }
+        .sheet(item: $share, onDismiss: {
+            if let url = presentedShareURL {
+                presentedShareURL = nil
+                TemporaryExportSweeper.scheduleDelayedRemoval(of: url)
+            }
+        }) { file in
+            ShareSheet(items: [file.url])
+                .onAppear { presentedShareURL = file.url }
+        }
+        .actionConfirmation(isPresented: $resetSettings, title: "恢复默认设置？", message: "账号、已下载的安装包和已购记录不受影响。", confirmTitle: "恢复默认设置") {
+            Task {
+                if store.settings.appLock && AppLock.method != .unavailable {
+                    guard await AppLock.shared.authenticate(reason: AppText.text("恢复默认设置")) else { return }
+                }
+                store.settings = ToolSettings()
+            }
         }
     }
 }
 
 extension SettingsView {
+    private struct BackupPreviewSheetItem: Identifiable {
+        var id: String { "unified-backup-preview" }
+        let preview: UnifiedBackupPreview
+    }
+
+    private struct EncryptedBackupItem: Identifiable {
+        let id = UUID()
+        let data: Data
+    }
+
+    private func scheduleBackupImportPresentation() {
+        guard !importingBackup, deferredBackupImport != nil else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) {
+            guard !importingBackup, let outcome = deferredBackupImport else { return }
+            deferredBackupImport = nil
+            switch outcome {
+            case .success(.needsPassword(let encryptedData)):
+                pendingDecryptedPreview = nil
+                encryptedBackupItem = EncryptedBackupItem(data: encryptedData)
+            case .success(.ready(let preview)):
+                presentImportPreview(preview)
+            case .failure(let error):
+                store.errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func presentImportPreview(_ preview: UnifiedBackupPreview) {
+        if !preview.wasEncrypted && preview.accountEntries.isEmpty && preview.deviceGUID == nil && !preview.hasStoreProofs {
+            pendingBackup = preview.data
+        } else {
+            backupConflictPolicy = .skipExisting
+            restoreDeviceIdentity = preview.deviceGUID != nil || preview.hasStoreProofs
+            backupPreview = preview
+        }
+    }
+
     /// Checks every source at once, enabled or not, and shows each result
     /// under its row as it arrives.
     private func checkSources() {

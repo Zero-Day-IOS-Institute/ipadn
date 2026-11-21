@@ -8,16 +8,115 @@ enum PackageService {
             let parts = entry.path.split(separator: "/")
             return parts.count == 3 && parts[0] == "Payload" && parts[1].hasSuffix(".app") && parts[2] == "Info.plist"
         }) else { throw ToolError.message(AppText.text("这不是有效的 IPA 安装包")) }
+        let appPrefix = String(info.path.dropLast("Info.plist".count))
         let plist = try readPlist(info, archive: archive)
         let metadata: [String: Any]
         if let entry = archive["iTunesMetadata.plist"] { metadata = (try? readPlist(entry, archive: archive)) ?? [:] }
         else { metadata = [:] }
-        let name = plistString(plist["CFBundleDisplayName"] ?? plist["CFBundleName"])
+        let name = localizedBundleDisplayName(in: archive, appPrefix: appPrefix, basePlist: plist, metadata: metadata)
         let id = plistString(metadata["itemId"])
+        let build = plistString(plist["CFBundleVersion"])
+        let externalID = plistString(metadata["softwareVersionExternalIdentifier"])
         let size = (try FileManager.default.attributesOfItem(atPath: url.path)[.size] as? NSNumber)?.int64Value ?? 0
         return StoreApp(id: id.isEmpty ? UUID().uuidString : id, name: name.isEmpty ? url.deletingPathExtension().lastPathComponent : name,
                         bundleID: plistString(plist["CFBundleIdentifier"]), version: plistString(plist["CFBundleShortVersionString"]),
-                        size: size, minimumOS: plistString(plist["MinimumOSVersion"]))
+                        size: size, minimumOS: plistString(plist["MinimumOSVersion"]),
+                        externalVersionID: externalID.isEmpty ? nil : externalID,
+                        bundleVersion: build.isEmpty ? nil : build)
+    }
+
+    /// Resolves an IPA's display name in priority order:
+    /// 1) `iTunesMetadata.plist["itemName"]`
+    /// 2) `*.lproj/InfoPlist.strings` matching `Locale.preferredLanguages` (`CFBundleDisplayName` / `CFBundleName`)
+    /// 3) root `Info.plist` (`CFBundleDisplayName` / `CFBundleName`)
+    static func localizedBundleDisplayName(in archive: Archive, appPrefix: String,
+                                           basePlist: [String: Any], metadata: [String: Any]) -> String {
+        let storeItemName = plistString(metadata["itemName"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if !storeItemName.isEmpty { return storeItemName }
+
+        if let localized = localizedInfoPlistName(in: archive, appPrefix: appPrefix) {
+            return localized
+        }
+
+        return plistString(basePlist["CFBundleDisplayName"] ?? basePlist["CFBundleName"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func localizedInfoPlistName(in archive: Archive, appPrefix: String,
+                                               preferredLanguages: [String] = Locale.preferredLanguages) -> String? {
+        var candidates: [String] = []
+        var seen = Set<String>()
+        func addCandidate(_ code: String) {
+            let trimmed = code.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, seen.insert(trimmed.lowercased()).inserted else { return }
+            candidates.append(trimmed)
+        }
+        for pref in preferredLanguages {
+            let normalized = pref.replacingOccurrences(of: "_", with: "-")
+            addCandidate(normalized)
+            addCandidate(pref)
+            let parts = normalized.split(separator: "-").map(String.init)
+            if parts.count >= 2 {
+                addCandidate(parts[0] + "-" + parts[1])
+                addCandidate(parts[0] + "_" + parts[1])
+            }
+            if parts.first?.lowercased() == "zh" {
+                let lowerParts = parts.map { $0.lowercased() }
+                let isHant = lowerParts.contains("hant") || lowerParts.contains("tw") || lowerParts.contains("hk") || lowerParts.contains("mo")
+                if isHant {
+                    for code in ["zh-Hant", "zh_TW", "zh-TW", "zh_HK", "zh-HK", "zh-Hant-TW", "zh-Hant-HK"] { addCandidate(code) }
+                } else {
+                    for code in ["zh-Hans", "zh_CN", "zh-CN", "zh-Hans-CN", "zh"] { addCandidate(code) }
+                }
+            }
+            if let lang = parts.first { addCandidate(lang) }
+        }
+        for code in candidates {
+            let entryPath = appPrefix + code + ".lproj/InfoPlist.strings"
+            guard let entry = archive[entryPath] else { continue }
+            if let dict = try? readStrings(entry, archive: archive) {
+                let display = (dict["CFBundleDisplayName"] ?? dict["CFBundleName"] ?? "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !display.isEmpty { return display }
+            }
+        }
+        return nil
+    }
+
+    private static func readStrings(_ entry: Entry, archive: Archive) throws -> [String: String] {
+        let limit = 512 * 1024
+        guard entry.type == .file, entry.uncompressedSize <= UInt64(limit) else { return [:] }
+        var data = Data()
+        _ = try archive.extract(entry, consumer: {
+            guard data.count + $0.count <= limit else { throw ToolError.message(AppText.text("安装包已损坏")) }
+            data.append($0)
+        })
+        if let plist = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] {
+            var result: [String: String] = [:]
+            for (k, v) in plist {
+                if let s = v as? String { result[k] = s }
+            }
+            if !result.isEmpty { return result }
+        }
+        // Fallback for UTF-16 / UTF-8 `.strings` text format if PropertyListSerialization declines comments/BOM.
+        let text = String(data: data, encoding: .utf8)
+            ?? String(data: data, encoding: .utf16)
+            ?? String(data: data, encoding: .utf16LittleEndian)
+            ?? String(data: data, encoding: .utf16BigEndian)
+            ?? ""
+        guard !text.isEmpty else { return [:] }
+        var parsed: [String: String] = [:]
+        let pattern = #"\"([^\"]+)\"\s*=\s*\"([^\"]*)\"\s*;"#
+        if let regex = try? NSRegularExpression(pattern: pattern) {
+            let range = NSRange(text.startIndex..., in: text)
+            for match in regex.matches(in: text, range: range) {
+                if let kr = Range(match.range(at: 1), in: text),
+                   let vr = Range(match.range(at: 2), in: text) {
+                    parsed[String(text[kr])] = String(text[vr])
+                }
+            }
+        }
+        return parsed
     }
 
     static func deviceFamilies(_ url: URL) throws -> Set<Int> {
@@ -76,11 +175,15 @@ enum PackageService {
         try? FileManager.default.removeItem(at: working)
         try FileManager.default.copyItem(at: staging, to: working)
         defer { try? FileManager.default.removeItem(at: working) }
+        var stagingMetadata: [String: Any]?
         if let asset = asset {
             guard let sinf = asset.sinf, !sinf.isEmpty, let metadata = asset.metadata else {
                 throw ToolError.message(AppText.text("下载授权缺失，请重新下载"))
             }
             let archive = try Archive(url: working, accessMode: .update)
+            if let existingMetadataEntry = archive["iTunesMetadata.plist"] {
+                stagingMetadata = try? readPlist(existingMetadataEntry, archive: archive)
+            }
 
             // 1. Write / Update iTunesMetadata.plist
             try replace("iTunesMetadata.plist", data: metadata, archive: archive)
@@ -151,11 +254,11 @@ enum PackageService {
                     throw ToolError.message(AppText.text("此安装包不支持 iPad"))
                 }
             }
-            guard app.bundleID == asset.app.bundleID, app.version == asset.app.version else {
-                throw ToolError.message(AppText.text("下载的文件与所选应用或版本不一致，请重试"))
-            }
+            try verifyPackageMatchesAsset(package: app, stagingMetadata: stagingMetadata, asset: asset)
             app.id = asset.app.id
-            app.externalVersionID = asset.app.externalVersionID
+            if (app.externalVersionID ?? "").isEmpty {
+                app.externalVersionID = asset.app.externalVersionID
+            }
         }
         let filename = "\(id.uuidString)-\(filenameComponent(app.name, limit: 100))_\(filenameComponent(app.version, limit: 40)).ipa"
         let destination = LocalResources.packages.appendingPathComponent(filename)
@@ -163,6 +266,53 @@ enum PackageService {
         try? FileManager.default.createDirectory(at: LocalResources.packages, withIntermediateDirectories: true)
         try FileManager.default.moveItem(at: working, to: destination)
         return (filename, app)
+    }
+
+    static func verifyPackageMatchesAsset(package: StoreApp, stagingMetadata: [String: Any]?, asset: DownloadAsset) throws {
+        let mismatch = ToolError.message(AppText.text("下载的文件与所选应用或版本不一致，请重试"))
+        guard !package.bundleID.isEmpty, package.bundleID == asset.app.bundleID else { throw mismatch }
+
+        let dispatchMetadata = asset.decodedMetadata
+        if let dispatchBundleID = dispatchMetadata.map({ plistString($0["softwareVersionBundleId"]) }),
+           !dispatchBundleID.isEmpty, dispatchBundleID != package.bundleID {
+            throw mismatch
+        }
+
+        let expectedExt = (asset.app.externalVersionID ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let dispatchExt = dispatchMetadata.map { plistString($0["softwareVersionExternalIdentifier"]).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        let stagingExt = stagingMetadata.map { plistString($0["softwareVersionExternalIdentifier"]).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        if !expectedExt.isEmpty && !dispatchExt.isEmpty && expectedExt != dispatchExt { throw mismatch }
+        if !expectedExt.isEmpty && !stagingExt.isEmpty && expectedExt != stagingExt { throw mismatch }
+        if !asset.app.id.isEmpty, asset.app.id.allSatisfy(\.isNumber),
+           let stagingItemID = stagingMetadata.map({ plistString($0["itemId"]).trimmingCharacters(in: .whitespacesAndNewlines) }),
+           !stagingItemID.isEmpty, stagingItemID != asset.app.id {
+            throw mismatch
+        }
+
+        let packageShort = package.version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let packageBuild = (package.bundleVersion ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let assetShort = asset.app.version.trimmingCharacters(in: .whitespacesAndNewlines)
+        let dispatchShort = dispatchMetadata.map { plistString($0["bundleShortVersionString"]).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        let dispatchBuild = dispatchMetadata.map { plistString($0["bundleVersion"]).trimmingCharacters(in: .whitespacesAndNewlines) } ?? ""
+        let marketing = (asset.app.storeMarketingVersion ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+
+        // When Apple DownloadDispatch echoes a dotless live short version (e.g. "4800") alongside
+        // a dotted historical `bundleVersion` (e.g. "2.0.02"), only treat `dispatchShort` as an
+        // acceptable IPA short string when the build number does not contradict it.
+        var allowedShorts = [assetShort, dispatchBuild, marketing].filter { !$0.isEmpty }
+        if !dispatchShort.isEmpty {
+            let allowStaleDispatchShort = packageBuild.isEmpty || dispatchBuild.isEmpty || packageBuild == dispatchBuild ||
+                VersionService.versionPreference(dispatchShort) >= VersionService.versionPreference(dispatchBuild)
+            if allowStaleDispatchShort { allowedShorts.append(dispatchShort) }
+        }
+
+        let directMatch = !packageShort.isEmpty && allowedShorts.contains(packageShort)
+        let compatibleMarketingMatch = !packageShort.isEmpty && !marketing.isEmpty &&
+            (expectedExt.isEmpty || dispatchExt.isEmpty || expectedExt == dispatchExt) &&
+            VersionService.compatibleMarketingPrecision(marketing, buildRaw: packageShort) != nil
+        let legacyEmptyShortBuildMatch = packageShort.isEmpty && !packageBuild.isEmpty &&
+            !dispatchBuild.isEmpty && packageBuild == dispatchBuild
+        guard directMatch || compatibleMarketingMatch || legacyEmptyShortBuildMatch else { throw mismatch }
     }
 
     static func sinfTargets(paths: [String], sinfs: [Data], bundleFolder: String) throws -> [(path: String, data: Data)] {

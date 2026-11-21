@@ -116,13 +116,17 @@ struct StoreApp: Codable, Identifiable, Hashable {
     // No public listing in any storefront (removed from sale); the App ID
     // still works for accounts that own it.
     var delisted: Bool?
+    /// Internal `CFBundleVersion` read from Info.plist or dispatch ticket.
+    var bundleVersion: String? = nil
+    /// App Store public marketing version when tracked separately from `CFBundleShortVersionString`.
+    var storeMarketingVersion: String? = nil
     static let delistedPlaceholder = "未在公开商店找到"
     var isDelisted: Bool { delisted == true || category == Self.delistedPlaceholder }
     /// Category for display; never the legacy delisted placeholder.
     var displayCategory: String { category == Self.delistedPlaceholder ? "" : category }
 }
 
-struct AppVersion: Codable, Identifiable, Hashable {
+struct AppVersion: Codable, Identifiable, Hashable, Sendable {
     /// Version lists from Apple carry only IDs. The placeholder is data, not
     /// display text: it is stored, merged and compared, so it stays fixed.
     static let unknown = "未知版本"
@@ -148,6 +152,19 @@ struct AppleAccount: Codable, Identifiable {
     var passwordToken: String
     var storeFront: String
     var fullStoreFront: String
+
+    /// Authenticated store session: Apple sign-in issues both DSID and token.
+    /// Imported profile placeholders leave credentials empty until signed in here.
+    var hasValidSession: Bool {
+        !dsid.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !passwordToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var needsReauthentication: Bool { !hasValidSession }
+
+    static func normalizedIdentifier(_ value: String) -> String {
+        value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
 }
 
 struct DownloadAsset: Codable {
@@ -172,6 +189,14 @@ struct DownloadAsset: Codable {
         self.platform = platform
         self.account = account
     }
+
+    var decodedMetadata: [String: Any]? {
+        guard let metadata, !metadata.isEmpty,
+              let plist = try? PropertyListSerialization.propertyList(from: metadata, format: nil) as? [String: Any] else {
+            return nil
+        }
+        return plist
+    }
 }
 
 struct OwnedApp: Codable, Identifiable {
@@ -184,6 +209,11 @@ struct OwnedApp: Codable, Identifiable {
     var storeApp: StoreApp {
         StoreApp(id: id, name: name, bundleID: bundleID, version: version, iconURL: iconURL)
     }
+}
+
+struct OwnedHistorySyncState: Codable, Equatable {
+    var completedFullSync: Bool
+    var lastSyncedYear: Int
 }
 
 enum DownloadStatus: String, Codable {
@@ -229,13 +259,84 @@ struct DownloadJob: Codable, Identifiable {
     // already associated with the authorized download.
     func completing(with inspected: StoreApp) -> StoreApp {
         var completed = inspected
+        // Narrow overwrite guard: only retain previous name when new name is pure ASCII fallback
+        // (e.g. "Kwai") while old name already contains non-ASCII localized characters (e.g. "快手").
+        let oldName = app.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let newName = inspected.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !oldName.isEmpty,
+           oldName.contains(where: { !$0.isASCII }),
+           (newName.isEmpty || newName.allSatisfy(\.isASCII)) {
+            completed.name = oldName
+        }
         completed.iconURL = inspected.iconURL ?? app.iconURL ?? asset?.app.iconURL
+        completed.storeMarketingVersion = inspected.storeMarketingVersion ?? app.storeMarketingVersion ?? asset?.app.storeMarketingVersion
+        if completed.bundleVersion == nil {
+            completed.bundleVersion = app.bundleVersion ?? asset?.app.bundleVersion
+        }
         return completed
     }
     func displayApp(packageIcon: URL?) -> StoreApp {
         var displayed = app
         displayed.iconURL = packageIcon ?? app.iconURL ?? asset?.app.iconURL
         return displayed
+    }
+    var resolvedMarketingVersion: String? {
+        for candidate in [app.storeMarketingVersion, asset?.app.storeMarketingVersion] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+    /// User-facing version prioritizing verified App Store marketing version over `CFBundleShortVersionString`.
+    var userFacingVersion: String { resolvedMarketingVersion ?? app.version }
+    /// App name paired with user-facing version for Live Activity, alerts, and auto-install notices.
+    var userFacingTitle: String { [app.name, userFacingVersion].filter { !$0.isEmpty }.joined(separator: " ") }
+    /// Build number (`CFBundleVersion`) preserved on the job or dispatch ticket, if known.
+    var resolvedBundleVersion: String? {
+        for candidate in [app.bundleVersion, asset?.app.bundleVersion] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+    /// App Store external version identifier associated with the download or dispatch ticket.
+    var resolvedExternalVersionID: String? {
+        for candidate in [app.externalVersionID, asset?.app.externalVersionID] {
+            if let value = candidate?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+    /// Concise version label (`v3.8`) for download list rows without internal build numbers or IDs.
+    var conciseVersionLabel: String {
+        let version = userFacingVersion.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !version.isEmpty, version != AppVersion.unknown else { return "" }
+        return "v\(version)"
+    }
+    /// Upgrades incomplete or failed jobs loaded from older app saves whose
+    /// `app.version` took a stale dotless dispatch short string instead of a dotted `bundleVersion`.
+    mutating func reconcileDispatchVersionFromMetadata() {
+        guard let plist = asset?.decodedMetadata else { return }
+        let dispatchBuild = plistString(plist["bundleVersion"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let dispatchExternalID = plistString(plist["softwareVersionExternalIdentifier"]).trimmingCharacters(in: .whitespacesAndNewlines)
+        if app.bundleVersion == nil, !dispatchBuild.isEmpty {
+            app.bundleVersion = dispatchBuild
+        }
+        if (app.externalVersionID ?? "").isEmpty, !dispatchExternalID.isEmpty {
+            app.externalVersionID = dispatchExternalID
+        }
+        guard status != .completed, !dispatchBuild.isEmpty else { return }
+        let reconciled = VersionService.reconcileTicketVersion(shortVersion: app.version, buildVersion: dispatchBuild)
+        if !reconciled.isEmpty && reconciled != app.version {
+            app.version = reconciled
+            asset?.app.version = reconciled
+        }
+        if asset?.app.bundleVersion == nil {
+            asset?.app.bundleVersion = dispatchBuild
+        }
     }
     /// Where a newer version of this download would come from; nil for
     /// developer-site installers and files without an App ID.
@@ -262,6 +363,9 @@ struct DownloadJob: Codable, Identifiable {
     }
 
     var storeVersion: String {
+        if let marketing = resolvedMarketingVersion {
+            return marketing
+        }
         let ticket = asset?.app.version ?? ""
         return ticket.isEmpty ? app.version : ticket
     }
@@ -300,6 +404,10 @@ struct ToolSettings: Codable, Equatable {
     var proMode = false
     /// The Discover section (top charts) on the search page.
     var showDiscover = true
+    /// Screenshot preview strip on the app detail page.
+    var showAppScreenshots = true
+    /// Reviews card and review loading on the app detail page.
+    var showAppReviews = true
     /// Face ID, Touch ID or the passcode before iPadn's content shows.
     var appLock = false
     /// Seconds away from iPadn before the lock asks again.
@@ -310,6 +418,12 @@ struct ToolSettings: Codable, Equatable {
     var autoInstall = false
     /// Download progress on the Lock Screen and in the Dynamic Island.
     var downloadLiveActivity = true
+    /// Shows app icons beside historical versions and fetches them on demand.
+    var showHistoryIcons = true
+    /// Ranks confirmed-delisted matching apps ahead of listed results in keyword search.
+    var prioritizeDelistedSearchResults = true
+    /// Opt in to on-device translation; the system sheet remains the default.
+    var directTranslation = false
     var useSignerCache = true
     var appearance = "system"
     /// 2 once the appearance default is following the system (1.7.0 saved its dark default).
@@ -335,9 +449,9 @@ struct ToolSettings: Codable, Equatable {
         case store, maxConcurrentDownloads, maxQueuedDownloads, searchLimit, notifications
         case useSignerCache, appearance, plistServer, versionSources, localInstallation, localInstallHost
         case automaticInstallation, updateNotifications, proMode, watchNotifications, priceRegions, baseCurrency, appUpdateCheck, targetPrices
-        case appearanceSchema, compatibleDownloadMode, nativeInstallation, versionSourcesSchema, appLock, appLockDelay, showDiscover
+        case appearanceSchema, compatibleDownloadMode, nativeInstallation, versionSourcesSchema, appLock, appLockDelay, showDiscover, showAppScreenshots, showAppReviews
         case wifiOnlyDownloads, autoInstall
-        case downloadLiveActivity
+        case downloadLiveActivity, showHistoryIcons, prioritizeDelistedSearchResults, directTranslation
     }
     init(from decoder: Decoder) throws {
         self.init()
@@ -350,16 +464,29 @@ struct ToolSettings: Codable, Equatable {
         updateNotifications = try values.decodeIfPresent(Bool.self, forKey: .updateNotifications) ?? updateNotifications
         proMode = try values.decodeIfPresent(Bool.self, forKey: .proMode) ?? proMode
         showDiscover = try values.decodeIfPresent(Bool.self, forKey: .showDiscover) ?? showDiscover
+        showAppScreenshots = try values.decodeIfPresent(Bool.self, forKey: .showAppScreenshots) ?? showAppScreenshots
+        showAppReviews = try values.decodeIfPresent(Bool.self, forKey: .showAppReviews) ?? showAppReviews
         appLock = try values.decodeIfPresent(Bool.self, forKey: .appLock) ?? appLock
         appLockDelay = min(3600, max(0, try values.decodeIfPresent(Int.self, forKey: .appLockDelay) ?? appLockDelay))
         wifiOnlyDownloads = try values.decodeIfPresent(Bool.self, forKey: .wifiOnlyDownloads) ?? wifiOnlyDownloads
         autoInstall = try values.decodeIfPresent(Bool.self, forKey: .autoInstall) ?? autoInstall
         downloadLiveActivity = try values.decodeIfPresent(Bool.self, forKey: .downloadLiveActivity) ?? downloadLiveActivity
+        showHistoryIcons = try values.decodeIfPresent(Bool.self, forKey: .showHistoryIcons) ?? showHistoryIcons
+        prioritizeDelistedSearchResults = try values.decodeIfPresent(Bool.self, forKey: .prioritizeDelistedSearchResults) ?? prioritizeDelistedSearchResults
+        directTranslation = try values.decodeIfPresent(Bool.self, forKey: .directTranslation) ?? directTranslation
         watchNotifications = try values.decodeIfPresent(Bool.self, forKey: .watchNotifications) ?? watchNotifications
         targetPrices = try values.decodeIfPresent(Bool.self, forKey: .targetPrices) ?? targetPrices
-        let regions = (try values.decodeIfPresent([String].self, forKey: .priceRegions) ?? priceRegions).filter { StoreRegions.codes.contains($0) }
+        var seenRegions = Set<String>()
+        let regions = (try values.decodeIfPresent([String].self, forKey: .priceRegions) ?? priceRegions)
+            .map { $0.uppercased() }
+            .filter { StoreRegions.codes.contains($0) && seenRegions.insert($0).inserted }
         priceRegions = regions.isEmpty ? priceRegions : regions
-        baseCurrency = try values.decodeIfPresent(String.self, forKey: .baseCurrency) ?? baseCurrency
+        let decodedCurrency = (try values.decodeIfPresent(String.self, forKey: .baseCurrency) ?? baseCurrency)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+        if decodedCurrency.count == 3, decodedCurrency.allSatisfy({ $0.isASCII && $0.isLetter }) {
+            baseCurrency = decodedCurrency
+        }
         compatibleDownloadMode = try values.decodeIfPresent(Bool.self, forKey: .compatibleDownloadMode) ?? compatibleDownloadMode
         appUpdateCheck = try values.decodeIfPresent(Bool.self, forKey: .appUpdateCheck) ?? appUpdateCheck
         useSignerCache = try values.decodeIfPresent(Bool.self, forKey: .useSignerCache) ?? useSignerCache
@@ -374,7 +501,9 @@ struct ToolSettings: Codable, Equatable {
         localInstallHost = ManifestBuilder.migratedLocalHost(try values.decodeIfPresent(String.self, forKey: .localInstallHost) ?? localInstallHost)
         automaticInstallation = try values.decodeIfPresent(Bool.self, forKey: .automaticInstallation) ?? automaticInstallation
         nativeInstallation = try values.decodeIfPresent(Bool.self, forKey: .nativeInstallation) ?? nativeInstallation
-        versionSources = try values.decodeIfPresent([VersionSource].self, forKey: .versionSources) ?? versionSources
+        let decodedSources = try values.decodeIfPresent([VersionSource].self, forKey: .versionSources) ?? versionSources
+        var seenSourceIDs = Set<UUID>()
+        versionSources = decodedSources.filter { seenSourceIDs.insert($0.id).inserted }
         // Lists saved before iosdump was a default get it once; removing it later sticks.
         if (try values.decodeIfPresent(Int.self, forKey: .versionSourcesSchema) ?? 1) < 2,
            !versionSources.contains(where: { $0.url(for: "1")?.host == VersionSource.iosDump.url(for: "1")?.host }) {
@@ -447,6 +576,7 @@ enum LocalResources {
     static let jobsFilename = "download-jobs.json"
     static let versionsFilename = "versions.json"
     static let ownedFilename = "owned-apps.json"
+    static let ownedHistoryStateFilename = "owned-history-state.json"
 
     // Resolved and created once per launch: these are read from list rows
     // many times a second, so they must not touch the file system each time.
@@ -498,8 +628,24 @@ enum LocalResources {
     }
 }
 
+private final class FileByteFormatterCache: @unchecked Sendable {
+    static let shared = FileByteFormatterCache()
+    private let lock = NSLock()
+    private let formatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
+
+    func format(_ count: Int64) -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return formatter.string(fromByteCount: count)
+    }
+}
+
 extension Int64 {
-    var byteLabel: String { ByteCountFormatter.string(fromByteCount: self, countStyle: .file) }
+    var byteLabel: String { FileByteFormatterCache.shared.format(self) }
 }
 
 func plistString(_ value: Any?) -> String {
@@ -537,7 +683,7 @@ enum VersionOrder {
 }
 
 enum DownloadFilter: String, CaseIterable, Identifiable {
-    case all = "全部", active = "进行中", paused = "已暂停", completed = "已完成", failed = "失败"
+    case all = "全部", active = "进行中", paused = "已暂停", completed = "已完成", failed = "失败", testFlight = "TestFlight"
     var id: String { rawValue }
     /// Shown in menus and row headers; `rawValue` also tags the row identifiers.
     var title: String {
@@ -547,6 +693,7 @@ enum DownloadFilter: String, CaseIterable, Identifiable {
         case .paused: return AppText.text("已暂停")
         case .completed: return AppText.text("已完成")
         case .failed: return AppText.text("失败")
+        case .testFlight: return "TestFlight"
         }
     }
     var symbol: String {
@@ -556,6 +703,7 @@ enum DownloadFilter: String, CaseIterable, Identifiable {
         case .paused: return "pause.circle"
         case .completed: return "checkmark.circle"
         case .failed: return "exclamationmark.circle"
+        case .testFlight: return "airplane"
         }
     }
     func includes(_ status: DownloadStatus) -> Bool {
@@ -565,7 +713,11 @@ enum DownloadFilter: String, CaseIterable, Identifiable {
         case .paused: return status == .paused
         case .completed: return status == .completed
         case .failed: return status == .failed
+        case .testFlight: return false
         }
+    }
+    var includesTestFlight: Bool {
+        self == .all || self == .completed || self == .testFlight
     }
 }
 

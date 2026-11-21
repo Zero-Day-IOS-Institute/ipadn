@@ -42,16 +42,22 @@ test_id = uid("TestTarget")
 app_product = add("AppProduct", "PBXFileReference", explicitFileType="wrapper.application", includeInIndex="0", path="iPadn.app", sourceTree="BUILT_PRODUCTS_DIR")
 test_product = add("TestProduct", "PBXFileReference", explicitFileType="wrapper.cfbundle", includeInIndex="0", path="iPadnTests.xctest", sourceTree="BUILT_PRODUCTS_DIR")
 app_files, sources = [], []
-for path in sorted((ROOT / "iPadn").rglob("*.swift")):
+for path in sorted((ROOT / "iPadn").rglob("*.swift"), key=lambda path: tuple(part.casefold() for part in path.parts)):
     relative = path.relative_to(ROOT / "iPadn").as_posix()
     reference = add("File/" + relative, "PBXFileReference", lastKnownFileType="sourcecode.swift", path=relative, sourceTree="<group>")
     app_files.append(reference)
     sources.append(add("Build/" + relative, "PBXBuildFile", fileRef=reference))
+# Xcode builds use the same entitlement resolver as the xtool package.
+signing_capability = "../TestFlightKit/SigningCapability.swift"
+reference = add("File/" + signing_capability, "PBXFileReference", lastKnownFileType="sourcecode.swift",
+                path=signing_capability, sourceTree="<group>")
+app_files.append(reference)
+sources.append(add("Build/" + signing_capability, "PBXBuildFile", fileRef=reference))
 resources = []
 # String catalogs hold every user-facing string. The source language stays
 # Chinese (the keys are the Chinese text); English is translated in the catalog.
-for path, file_type in [("Resources/SAPRuntime", "folder"), ("Resources/Assets.xcassets", "folder.assetcatalog"), ("Resources/PrivacyInfo.xcprivacy", "text.xml"), ("Resources/app-name-directory.json", "text.json"),
-                       ("Resources/Localizable.xcstrings", "text.json.xcstrings"), ("Resources/InfoPlist.xcstrings", "text.json.xcstrings")]:
+for path, file_type in [("Resources/SAPRuntime", "folder"), ("Resources/RevealAnimations", "folder"), ("Resources/Assets.xcassets", "folder.assetcatalog"), ("Resources/PrivacyInfo.xcprivacy", "text.xml"), ("Resources/app-name-directory.json", "text.json"),
+                       ("Resources/Localizable.xcstrings", "text.json.xcstrings"), ("Resources/InfoPlist.xcstrings", "text.json.xcstrings"), ("Resources/ZIPFoundation-MIT.txt", "text")]:
     reference = add("File/" + path, "PBXFileReference", lastKnownFileType=file_type, path=path, sourceTree="<group>")
     app_files.append(reference)
     resources.append(add("Build/" + path, "PBXBuildFile", fileRef=reference))
@@ -90,6 +96,12 @@ for path in sorted((ROOT / "iPadnTests").glob("*.swift")):
     reference = add("TestFile/" + path.name, "PBXFileReference", lastKnownFileType="sourcecode.swift", path=path.name, sourceTree="<group>")
     test_files.append(reference)
     test_sources.append(add("TestBuild/" + path.name, "PBXBuildFile", fileRef=reference))
+fairplay_files = [
+    add("FairPlayFile/FairPlayCore.c", "PBXFileReference", lastKnownFileType="sourcecode.c.c", path="FairPlayCore.c", sourceTree="<group>"),
+    add("FairPlayFile/include/FairPlayCore.h", "PBXFileReference", lastKnownFileType="sourcecode.c.h", path="include/FairPlayCore.h", sourceTree="<group>"),
+    add("FairPlayFile/include/module.modulemap", "PBXFileReference", lastKnownFileType="sourcecode.module-map", path="include/module.modulemap", sourceTree="<group>"),
+]
+sources.append(add("FairPlayBuild/FairPlayCore.c", "PBXBuildFile", fileRef=fairplay_files[0]))
 package = add("ZIPFoundation", "XCRemoteSwiftPackageReference", repositoryURL="https://github.com/weichsel/ZIPFoundation.git",
               requirement={"kind": "exactVersion", "version": "0.9.19"})
 app_package = add("ZIPFoundation/App", "XCSwiftPackageProductDependency", package=package, productName="ZIPFoundation")
@@ -97,15 +109,17 @@ test_package = add("ZIPFoundation/Tests", "XCSwiftPackageProductDependency", pac
 app_framework = add("ZIPFoundation/AppBuild", "PBXBuildFile", productRef=app_package)
 test_framework = add("ZIPFoundation/TestBuild", "PBXBuildFile", productRef=test_package)
 app_group = add("AppGroup", "PBXGroup", children=app_files, path="iPadn", sourceTree="<group>")
+fairplay_group = add("FairPlayGroup", "PBXGroup", children=fairplay_files, path="FairPlayCore", sourceTree="<group>")
 test_group = add("TestGroup", "PBXGroup", children=test_files, path="iPadnTests", sourceTree="<group>")
 products = add("Products", "PBXGroup", children=[app_product, test_product], name="Products", sourceTree="<group>")
-root_group = add("MainGroup", "PBXGroup", children=[app_group, test_group, products], sourceTree="<group>")
+root_group = add("MainGroup", "PBXGroup", children=[app_group, fairplay_group, test_group, products], sourceTree="<group>")
 app_sources = add("AppSources", "PBXSourcesBuildPhase", buildActionMask="2147483647", files=sources, runOnlyForDeploymentPostprocessing="0")
 app_resources = add("AppResources", "PBXResourcesBuildPhase", buildActionMask="2147483647", files=resources, runOnlyForDeploymentPostprocessing="0")
 app_frameworks = add("AppFrameworks", "PBXFrameworksBuildPhase", buildActionMask="2147483647", files=[app_framework], runOnlyForDeploymentPostprocessing="0")
+runtime_manifest_files = sorted(json.loads((ROOT / "vendor/SAPRuntime/manifest.json").read_text(encoding="utf-8"))["files"])
 assemble = add("AssembleWASM", "PBXShellScriptBuildPhase", buildActionMask="2147483647", files=[],
                inputPaths=["$(SRCROOT)/scripts/assemble_runtime.py", "$(SRCROOT)/vendor/SAPRuntime"],
-               outputPaths=["$(SRCROOT)/iPadn/Resources/SAPRuntime/" + name for name in ["sap.wasm", "index.html", "sap-signer.js", "wasm_exec.js", "unicorn_x86.js", "libCoreADI.so", "libstoreservicescore.so"]],
+               outputPaths=["$(SRCROOT)/iPadn/Resources/SAPRuntime/" + name for name in runtime_manifest_files],
                name="Verify local signing runtime", runOnlyForDeploymentPostprocessing="0", shellPath="/bin/bash",
                shellScript='set -euo pipefail\npython3 "$SRCROOT/scripts/assemble_runtime.py"\n', alwaysOutOfDate="1")
 tests_sources = add("TestsSources", "PBXSourcesBuildPhase", buildActionMask="2147483647", files=test_sources, runOnlyForDeploymentPostprocessing="0")
@@ -124,13 +138,15 @@ base = {"IPHONEOS_DEPLOYMENT_TARGET": "16.0", "SDKROOT": "iphoneos", "SWIFT_VERS
 project_configs = configs("Project", base, {"SWIFT_COMPILATION_MODE": "wholemodule", "VALIDATE_PRODUCT": "YES"})
 app_settings = {"PRODUCT_BUNDLE_IDENTIFIER": "app.local.iPadn", "PRODUCT_NAME": "$(TARGET_NAME)", "CODE_SIGN_STYLE": "Automatic",
                 "DEVELOPMENT_TEAM": "", "TARGETED_DEVICE_FAMILY": "1,2", "INFOPLIST_FILE": "iPadn/Info.plist",
-                "GENERATE_INFOPLIST_FILE": "NO", "MARKETING_VERSION": "2.1.1", "CURRENT_PROJECT_VERSION": "31",
+                "GENERATE_INFOPLIST_FILE": "NO", "MARKETING_VERSION": "2.3.2", "CURRENT_PROJECT_VERSION": "38",
                 "SWIFT_EMIT_LOC_STRINGS": "YES", "LOCALIZATION_PREFERS_STRING_CATALOGS": "YES",
                 "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
                 "ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS": "YES", "ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME": "AccentColor",
                 "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks"],
                 "ENABLE_PREVIEWS": "YES", "SUPPORTS_MACCATALYST": "NO", "SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD": "NO",
                 "ENABLE_USER_SCRIPT_SANDBOXING": "NO",
+                "SWIFT_INCLUDE_PATHS": ["$(inherited)", "$(SRCROOT)/FairPlayCore/include"],
+                "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/FairPlayCore/include"],
                 # Empty unless scripts/build_unsigned_ipa.sh built the Mac PKG bridge.
                 "IPADN_MACPKG_LDFLAGS": "",
                 # Empty unless scripts/build_unsigned_ipa.sh built the native installation library.
@@ -139,6 +155,8 @@ app_settings = {"PRODUCT_BUNDLE_IDENTIFIER": "app.local.iPadn", "PRODUCT_NAME": 
 test_settings = {"PRODUCT_BUNDLE_IDENTIFIER": "app.local.iPadnTests", "PRODUCT_NAME": "$(TARGET_NAME)", "CODE_SIGN_STYLE": "Automatic",
                  "DEVELOPMENT_TEAM": "", "TARGETED_DEVICE_FAMILY": "1,2", "GENERATE_INFOPLIST_FILE": "YES",
                  "TEST_HOST": "$(BUILT_PRODUCTS_DIR)/iPadn.app/iPadn", "BUNDLE_LOADER": "$(TEST_HOST)",
+                 "SWIFT_INCLUDE_PATHS": ["$(inherited)", "$(SRCROOT)/FairPlayCore/include"],
+                 "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/FairPlayCore/include"],
                  "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks", "@loader_path/Frameworks"]}
 app_configs = configs("App", app_settings)
 test_configs = configs("Tests", test_settings)
@@ -179,7 +197,7 @@ extension_resources = add("ExtensionResources", "PBXResourcesBuildPhase", buildA
                           files=[add("ExtensionBuild/Localizable.xcstrings", "PBXBuildFile", fileRef=extension_catalog)], runOnlyForDeploymentPostprocessing="0")
 objects[root_group]["children"].append(add("ExtensionGroup", "PBXGroup", children=extension_files, path="iPadnLiveActivity", sourceTree="<group>"))
 extension_phase = add("ExtensionSources", "PBXSourcesBuildPhase", buildActionMask="2147483647", files=extension_sources, runOnlyForDeploymentPostprocessing="0")
-extension_settings = {"IPHONEOS_DEPLOYMENT_TARGET": "17.0", "PRODUCT_BUNDLE_IDENTIFIER": "app.local.iPadn.LiveActivity", "PRODUCT_NAME": "$(TARGET_NAME)", "CODE_SIGN_STYLE": "Automatic",
+extension_settings = {"PRODUCT_BUNDLE_IDENTIFIER": "app.local.iPadn.LiveActivity", "PRODUCT_NAME": "$(TARGET_NAME)", "CODE_SIGN_STYLE": "Automatic",
                       "DEVELOPMENT_TEAM": "", "TARGETED_DEVICE_FAMILY": "1,2", "INFOPLIST_FILE": "iPadnLiveActivity/Info.plist",
                       "GENERATE_INFOPLIST_FILE": "NO", "MARKETING_VERSION": app_settings["MARKETING_VERSION"],
                       "CURRENT_PROJECT_VERSION": app_settings["CURRENT_PROJECT_VERSION"], "SKIP_INSTALL": "YES",

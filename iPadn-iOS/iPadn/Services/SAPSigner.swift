@@ -47,8 +47,11 @@ final class SAPSigner: NSObject, ObservableObject, WKNavigationDelegate, WKScrip
             NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification))
             .sink { [weak self] _ in
                 Task { @MainActor in
-                    self?.discardIdleRuntime()
-                    await self?.server.reset()
+                    guard let self else { return }
+                    self.discardIdleRuntime()
+                    if self.operationID == nil && self.waiters.isEmpty {
+                        await self.server.reset()
+                    }
                 }
             }
     }
@@ -142,6 +145,21 @@ final class SAPSigner: NSObject, ObservableObject, WKNavigationDelegate, WKScrip
         all[normalizedGUID] = updated
         storeProofRecords = all
         StoreProofStore.save(all)
+    }
+
+    func restoreStoreProofRecords(_ imported: [String: StoreProofRecord], preferImported: Bool) {
+        var merged = currentStoreRecords()
+        for (rawKey, record) in imported {
+            let key = AccountBackupService.normalizedDeviceGUID(rawKey) ?? rawKey.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+            guard !key.isEmpty, !record.identifier.isEmpty else { continue }
+            if let existing = merged[key], !preferImported, existing.updatedAt > record.updatedAt {
+                continue
+            }
+            merged[key] = record
+        }
+        storeProofRecords = merged
+        StoreProofStore.save(merged)
+        clearCache()
     }
 
     func storeProofHeaders(guid: String, useCache: Bool) async throws -> [String: String]? {
@@ -252,7 +270,8 @@ final class SAPSigner: NSObject, ObservableObject, WKNavigationDelegate, WKScrip
             web.navigationDelegate = self
             webView = web; isPresented = true
             if !warm {
-                armTimeout(id: id, seconds: 45, message: AppText.text("本地验证环境加载超时，请重试。"))
+                let loadTimeout = max(45, min(timeoutSeconds, 90))
+                armTimeout(id: id, seconds: loadTimeout, message: AppText.text("本地验证环境加载超时，请重试。"))
                 try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
                     navigation = continuation
                     web.load(URLRequest(url: base.appendingPathComponent("runtime/index.html")))

@@ -9,7 +9,9 @@ final class AppleService: ObservableObject {
     let signer: SAPSigner
     private var loginInProgress = false
     private(set) var loginDiagnostic = "No login attempted in this session."
-    var active: AppleAccount? { accounts.first { $0.id == activeID } }
+    /// Active signed-in account with valid session credentials.
+    /// Imported placeholder profiles without tokens never resolve as `active`.
+    var active: AppleAccount? { accounts.first { $0.id == activeID && $0.hasValidSession } }
     var guid: String {
         if let value = LocalResources.defaults.string(forKey: LocalResources.guid) { return value }
         let value = Self.randomGUID()
@@ -33,11 +35,12 @@ final class AppleService: ObservableObject {
         self.signer = signer
         do { accounts = try KeychainStore.load() } catch { accountStorageError = error.localizedDescription }
         activeID = LocalResources.defaults.string(forKey: LocalResources.activeAccount)
-        if !accounts.contains(where: { $0.id == activeID }) { activeID = nil }
+        if active?.hasValidSession != true { activeID = nil }
     }
 
     /// Session cookies updated by store responses, by account, not yet saved.
     private var liveCookies: [String: String] = [:]
+    private var commercePods: [String: String] = [:]
     private var cookiesSavedAt = Date.distantPast
 
     func login(email: String, password: String, code: String, useCache: Bool) async throws {
@@ -162,7 +165,9 @@ final class AppleService: ObservableObject {
         let account = AppleAccount(id: id, name: name.isEmpty ? id : name, password: password, cookie: cookie,
                                    dsid: resolvedDSID, passwordToken: passwordToken,
                                    storeFront: StoreService.storefrontIdentifier(fullStore), fullStoreFront: fullStore)
-        let updated = [account] + accounts.filter { $0.id != id }
+        let updated = [account] + accounts.filter {
+            AppleAccount.normalizedIdentifier($0.id) != AppleAccount.normalizedIdentifier(id)
+        }
         try Task.checkCancellation()
         guard activeID == initialAccount else { throw ToolError.message(AppText.text("账号已切换，已停止保存本次登录")) }
         do { try KeychainStore.save(updated) }
@@ -176,9 +181,13 @@ final class AppleService: ObservableObject {
     }
 
     func select(_ id: String?) {
-        guard id == nil || accounts.contains(where: { $0.id == id }) else { return }
-        activeID = id
-        LocalResources.defaults.set(id, forKey: LocalResources.activeAccount)
+        if let id {
+            guard let account = accounts.first(where: { $0.id == id }), account.hasValidSession else { return }
+            activeID = account.id
+        } else {
+            activeID = nil
+        }
+        LocalResources.defaults.set(activeID, forKey: LocalResources.activeAccount)
         signer.clearCache()
     }
     func remove(_ id: String) throws {
@@ -186,6 +195,119 @@ final class AppleService: ObservableObject {
         try KeychainStore.save(updated)
         accounts = updated
         if activeID == id { select(nil) }
+    }
+
+    /// Snapshot of freshest in-memory cookies for full backup export.
+    func flushedAccountsForBackup() -> [AppleAccount] {
+        saveLiveCookies()
+        guard !liveCookies.isEmpty else { return accounts }
+        return accounts.map { account in
+            var copy = account
+            if let fresh = liveCookies[account.id] { copy.cookie = fresh }
+            return copy
+        }
+    }
+
+    struct AccountBackupImportOutcome {
+        let merge: AccountBackupService.MergeResult
+        let restoredDeviceIdentity: Bool
+        let addedNeedsReauthCount: Int
+        let restoredSessionCount: Int
+    }
+
+    @discardableResult
+    func importAccountBackup(
+        entries: [AccountSessionEntry],
+        preferredActiveID: String? = nil,
+        deviceGUID: String? = nil,
+        storeProofRecords: [String: StoreProofRecord]? = nil,
+        policy: AccountBackupConflictPolicy = .skipExisting,
+        restoreDeviceIdentity: Bool = false
+    ) throws -> AccountBackupImportOutcome {
+        let hadValidLocalSession = accounts.contains(where: \.hasValidSession)
+        let merged = AccountBackupService.merge(entries: entries, into: accounts, policy: policy)
+        if !merged.addedIDs.isEmpty || !merged.updatedIDs.isEmpty || merged.mergedAccounts.count != accounts.count {
+            try KeychainStore.save(merged.mergedAccounts)
+            for id in merged.updatedIDs + merged.addedIDs {
+                liveCookies.removeValue(forKey: id)
+            }
+            accounts = merged.mergedAccounts
+        }
+
+        let currentStillValid = activeID.flatMap { id in accounts.first(where: { $0.id == id && $0.hasValidSession }) } != nil
+        if !currentStillValid || policy == .overwriteExisting {
+            if let preferred = preferredActiveID,
+               let match = accounts.first(where: {
+                   AppleAccount.normalizedIdentifier($0.id) == AppleAccount.normalizedIdentifier(preferred) && $0.hasValidSession
+               }) {
+                select(match.id)
+            } else if !currentStillValid,
+                      let firstValid = accounts.first(where: \.hasValidSession) {
+                select(firstValid.id)
+            } else if !currentStillValid {
+                activeID = nil
+                LocalResources.defaults.set(nil, forKey: LocalResources.activeAccount)
+            }
+        }
+
+        var didRestoreDeviceIdentity = false
+        if restoreDeviceIdentity {
+            if let importedProofs = storeProofRecords, !importedProofs.isEmpty {
+                signer.restoreStoreProofRecords(
+                    importedProofs,
+                    preferImported: policy == .overwriteExisting || !hadValidLocalSession
+                )
+                didRestoreDeviceIdentity = true
+            }
+            if let targetGUID = AccountBackupService.normalizedDeviceGUID(deviceGUID) {
+                if targetGUID != guid {
+                    try setGUID(targetGUID)
+                    signer.clearCache()
+                }
+                didRestoreDeviceIdentity = true
+            }
+        }
+
+        accountStorageError = nil
+        let touchedKeys = Set((merged.addedIDs + merged.updatedIDs).map(AppleAccount.normalizedIdentifier))
+        let touchedAccounts = accounts.filter { touchedKeys.contains(AppleAccount.normalizedIdentifier($0.id)) }
+        let needsReauthCount = touchedAccounts.filter(\.needsReauthentication).count
+        let sessionCount = touchedAccounts.filter(\.hasValidSession).count
+        return AccountBackupImportOutcome(
+            merge: merged,
+            restoredDeviceIdentity: didRestoreDeviceIdentity,
+            addedNeedsReauthCount: needsReauthCount,
+            restoredSessionCount: sessionCount
+        )
+    }
+
+    func importAccountProfiles(
+        _ entries: [AccountProfileEntry],
+        policy: AccountBackupConflictPolicy = .skipExisting
+    ) throws -> AccountBackupService.MergeResult {
+        try importAccountBackup(
+            entries: entries.map(AccountSessionEntry.init(from:)),
+            policy: policy,
+            restoreDeviceIdentity: false
+        ).merge
+    }
+
+    func importAccountProfiles(
+        _ backup: AccountProfileBackup,
+        policy: AccountBackupConflictPolicy = .skipExisting
+    ) throws -> AccountBackupService.MergeResult {
+        try importAccountBackup(
+            entries: backup.accounts.map(AccountSessionEntry.init(from:)),
+            preferredActiveID: backup.preferredActiveID,
+            policy: policy,
+            restoreDeviceIdentity: false
+        ).merge
+    }
+
+    private func requireSignedInAccount(missingMessage: String = AppText.text("请先登录 Apple 账号")) throws -> AppleAccount {
+        guard let account = active else { throw ToolError.message(missingMessage) }
+        guard account.hasValidSession else { throw AppleAuthError.reauthenticationRequired }
+        return account
     }
     /// Apple sends a code to trusted devices only when it is asked to sign in
     /// with the password and no code. Store requests that need verification
@@ -216,8 +338,11 @@ final class AppleService: ObservableObject {
 
     func refresh(_ account: AppleAccount, useCache: Bool) async throws -> AppleAccount {
         guard activeID == account.id else { throw ToolError.message(AppText.text("账号已切换，请重新执行操作")) }
+        guard !account.password.isEmpty else { throw AppleAuthError.reauthenticationRequired }
         try await login(email: account.id, password: account.password, code: "", useCache: useCache)
-        guard let refreshed = active, refreshed.id == account.id else { throw ToolError.message(AppText.text("登录已过期，请重新登录")) }
+        guard let refreshed = active, refreshed.id == account.id, refreshed.hasValidSession else {
+            throw AppleAuthError.reauthenticationRequired
+        }
         return refreshed
     }
 
@@ -232,7 +357,7 @@ final class AppleService: ObservableObject {
         guard store.platform.supportsIPA else {
             throw ToolError.message(AppText.text("Mac 应用请使用「获取 PKG」下载"))
         }
-        guard let account = active else { throw ToolError.message(AppText.text("请先登录 Apple 账号")) }
+        let account = try requireSignedInAccount()
         var targetVersion = versionID
         var tvListing: StoreApp?
         if store.platform == .tvOS {
@@ -250,6 +375,8 @@ final class AppleService: ObservableObject {
         var asset: DownloadAsset
         do {
             asset = try await fetchAsset(appID: appID, versionID: targetVersion, account: account,
+                                         platform: store.platform,
+                                         selectedCountry: allowLicenseAcquisition ? store.country : nil,
                                          useCache: useCache, fallback: false, refreshed: false, purchased: false,
                                          allowLicenseAcquisition: allowLicenseAcquisition)
         } catch let error as ToolError where targetVersion == nil && store.platform.usesIOSStore
@@ -259,6 +386,8 @@ final class AppleService: ObservableObject {
                   let latest = await StoreService.latestIOSVersionID(appID, bundleID: "", country: country, platform: store.platform)
             else { throw error }
             asset = try await fetchAsset(appID: appID, versionID: latest, account: account,
+                                         platform: store.platform,
+                                         selectedCountry: allowLicenseAcquisition ? store.country : nil,
                                          useCache: useCache, fallback: false, refreshed: false, purchased: false,
                                          allowLicenseAcquisition: allowLicenseAcquisition)
         }
@@ -270,7 +399,9 @@ final class AppleService: ObservableObject {
                 // iPhone build. Try Apple's alternate version-aware endpoint once
                 // before reporting that no verified tvOS file is available.
                 if let alternate = try? await fetchAsset(appID: appID, versionID: targetVersion,
-                    account: account, useCache: useCache, fallback: true,
+                    account: account, platform: store.platform,
+                    selectedCountry: allowLicenseAcquisition ? store.country : nil,
+                    useCache: useCache, fallback: true,
                     refreshed: false, purchased: false,
                     allowLicenseAcquisition: allowLicenseAcquisition),
                    alternate.platform.isEmpty || tvPlatforms.contains(alternate.platform.lowercased()) {
@@ -295,8 +426,9 @@ final class AppleService: ObservableObject {
     }
 
     private func fetchAsset(appID: String, versionID: String?, account: AppleAccount,
+                            platform: AppPlatform, selectedCountry: String?,
                             useCache: Bool, fallback: Bool, refreshed: Bool, purchased: Bool,
-                             allowLicenseAcquisition: Bool) async throws -> DownloadAsset {
+                            allowLicenseAcquisition: Bool) async throws -> DownloadAsset {
         guard activeID == account.id else { throw ToolError.message(AppText.text("账号已切换，请重新执行下载")) }
         let root = fallback ? "https://downloaddispatch.itunes.apple.com/up/backgroundUpdateProduct" :
             "https://downloaddispatch.itunes.apple.com/WebObjects/DownloadDispatch.woa/wa/ent/download"
@@ -326,6 +458,7 @@ final class AppleService: ObservableObject {
                 throw AppleAuthError.reauthenticationRequired
             }
             return try await fetchAsset(appID: appID, versionID: versionID, account: refreshedAccount,
+                platform: platform, selectedCountry: selectedCountry,
                 useCache: useCache, fallback: fallback, refreshed: true, purchased: purchased,
                 allowLicenseAcquisition: allowLicenseAcquisition)
         }
@@ -335,17 +468,25 @@ final class AppleService: ObservableObject {
             // here always calls authenticate and can trigger an invisible 2FA prompt.
             // Acquire the free license using the current valid account first.
             guard activeID == account.id else { throw ToolError.message(AppText.text("账号已切换，请重新执行下载")) }
-            try await acquireFreeApp(appID, account: account, useCache: useCache)
+            try await acquireFreeApp(appID, account: account, platform: platform,
+                                     selectedCountry: selectedCountry, useCache: useCache)
             return try await fetchAsset(appID: appID, versionID: versionID, account: account,
+                platform: platform, selectedCountry: selectedCountry,
                 useCache: useCache, fallback: fallback, refreshed: refreshed, purchased: true,
                 allowLicenseAcquisition: allowLicenseAcquisition)
         }
         // Viewing a version list never claims a license; say what is missing.
         if failure == "9610" && !allowLicenseAcquisition { throw AppleLicenseError.notOwned }
+        if allowLicenseAcquisition,
+           let regionalError = await diagnoseStorefrontFailure(failure, appID: appID, platform: platform,
+                                                               account: account, selectedCountry: selectedCountry) {
+            throw regionalError
+        }
         if let error = HTTPClient.appleFailure(raw) { throw error }
         guard let song = (raw["songList"] as? [[String: Any]])?.first else {
             if !fallback {
                 return try await fetchAsset(appID: appID, versionID: versionID, account: account,
+                    platform: platform, selectedCountry: selectedCountry,
                     useCache: useCache, fallback: true, refreshed: refreshed, purchased: purchased,
                     allowLicenseAcquisition: allowLicenseAcquisition)
             }
@@ -363,11 +504,15 @@ final class AppleService: ObservableObject {
         let artwork = song["artwork-urls"] as? [String: Any]
         let defaultArt = artwork?["default"] as? [String: Any]
         let assetInfo = song["asset-info"] as? [String: Any]
+        let rawShort = plistString(metadata["bundleShortVersionString"])
+        let rawBuild = plistString(metadata["bundleVersion"])
+        let resolvedVersion = VersionService.reconcileTicketVersion(shortVersion: rawShort, buildVersion: rawBuild)
         let app = StoreApp(id: plistString(song["songId"]).isEmpty ? appID : plistString(song["songId"]),
             name: plistString(metadata["bundleDisplayName"]), bundleID: plistString(metadata["softwareVersionBundleId"]),
-            version: plistString(metadata["bundleShortVersionString"]), iconURL: StoreService.icon(plistString(defaultArt?["url"])),
+            version: resolvedVersion.isEmpty ? rawShort : resolvedVersion, iconURL: StoreService.icon(plistString(defaultArt?["url"])),
             size: (assetInfo?["file-size"] as? NSNumber)?.int64Value ?? 0,
-            minimumOS: plistString(metadata["minimumOSVersion"] ?? metadata["minimumOsVersion"]), externalVersionID: externalID)
+            minimumOS: plistString(metadata["minimumOSVersion"] ?? metadata["minimumOsVersion"]), externalVersionID: externalID,
+            bundleVersion: rawBuild.isEmpty ? nil : rawBuild)
         // The server order is positional: SC_Info/Manifest.plist.SinfPaths
         // uses the same order. Sorting by the opaque `id`, or compacting a
         // missing item, assigns licenses to the wrong extension/framework.
@@ -380,11 +525,23 @@ final class AppleService: ObservableObject {
             platform: plistString(metadata["software-platform"]), account: account.id)
     }
 
+    struct VersionTicket: Sendable {
+        let url: URL
+        let displayVersion: String
+        let rawShortVersion: String
+        let buildVersion: String
+        let fileSize: Int64?
+    }
+
     /// Download ticket for one version, used only to read that version's
     /// Info.plist. Unlike a download it never acquires a license or signs in
     /// again, so browsing a version list cannot trigger a verification prompt.
     func versionTicket(appID: String, versionID: String, useCache: Bool) async throws -> URL {
-        guard let account = active, !account.dsid.isEmpty else { throw AppleAuthError.reauthenticationRequired }
+        try await versionTicketDetails(appID: appID, versionID: versionID, useCache: useCache).url
+    }
+
+    func versionTicketDetails(appID: String, versionID: String, useCache: Bool) async throws -> VersionTicket {
+        guard let account = active, account.hasValidSession else { throw AppleAuthError.reauthenticationRequired }
         guard let app = UInt64(appID), app > 0, UInt64(versionID).map({ $0 > 0 }) == true else {
             throw ToolError.message(AppText.text("版本 ID 只能包含数字"))
         }
@@ -405,7 +562,18 @@ final class AppleService: ObservableObject {
               [versionID, ""].contains(plistString(metadata["softwareVersionExternalIdentifier"])) else {
             throw ToolError.message(AppText.text("Apple 没有返回该版本的信息"))
         }
-        return url
+        let sanitizedShort = VersionService.sanitizedVersion(plistString(metadata["bundleShortVersionString"]), rejectingID: versionID)
+        let sanitizedBuild = VersionService.sanitizedVersion(plistString(metadata["bundleVersion"]), rejectingID: versionID)
+        let rawShortVersion = sanitizedShort == AppVersion.unknown ? "" : sanitizedShort
+        let buildVersion = sanitizedBuild == AppVersion.unknown ? "" : sanitizedBuild
+        let displayVersion = VersionService.reconcileTicketVersion(shortVersion: rawShortVersion, buildVersion: buildVersion)
+        let assetInfo = song["asset-info"] as? [String: Any]
+        let fileSize = (assetInfo?["file-size"] as? NSNumber)?.int64Value
+        return VersionTicket(url: url,
+                             displayVersion: displayVersion,
+                             rawShortVersion: rawShortVersion,
+                             buildVersion: buildVersion,
+                             fileSize: fileSize.flatMap { $0 > 0 ? $0 : nil })
     }
 
     static var noOfferMessage: String { AppText.text("Apple 没有返回该版本的下载信息") }
@@ -479,6 +647,7 @@ final class AppleService: ObservableObject {
     /// `arcade` false first; an iOS app that Apple reports unavailable (2059)
     /// is retried as an Apple Arcade game, as ipatool does.
     private func acquireFreeApp(_ id: String, account: AppleAccount, mac: Bool = false, arcade: Bool = false,
+                                platform: AppPlatform = .iOS, selectedCountry: String? = nil,
                                 useCache: Bool = true) async throws {
         let deviceID = guid
         let payload: [String: Any] = ["appExtVrsId": "0", "buyWithoutAuthorization": "true", "guid": deviceID,
@@ -492,17 +661,24 @@ final class AppleService: ObservableObject {
         // A license acquisition can independently require a new trusted-device
         // approval, even when the previous download token was accepted.
         if AppleAuthError.requiresReauthentication(raw) { throw AppleAuthError.reauthenticationRequired }
+        let failure = plistString(raw["failureType"])
         // The account already holds the license (ipatool): nothing to claim.
-        if plistString(raw["failureType"]) == "5002" { return }
+        if failure == "5002" { return }
         if plistString(raw["customerMessage"]) == "Subscription Required" {
             throw ToolError.message(AppText.text("此应用属于 Apple Arcade，需要此账号订阅 Apple Arcade 后才能下载。"))
         }
-        if plistString(raw["failureType"]) == "2059" && !mac && !arcade {
-            return try await acquireFreeApp(id, account: account, mac: mac, arcade: true, useCache: useCache)
+        if failure == "2059" && !mac && !arcade {
+            return try await acquireFreeApp(id, account: account, mac: mac, arcade: true,
+                                            platform: platform, selectedCountry: selectedCountry,
+                                            useCache: useCache)
         }
-        if ["2034", "2042"].contains(plistString(raw["failureType"])) ||
+        if ["2034", "2042"].contains(failure) ||
            plistString(raw["customerMessage"]) == "MZFinance.BadLogin.Configurator_message" {
             throw AppleLoginError.verificationRequired
+        }
+        if let regionalError = await diagnoseStorefrontFailure(failure, appID: id, platform: mac ? .macOS : platform,
+                                                               account: account, selectedCountry: selectedCountry) {
+            throw regionalError
         }
         if let error = HTTPClient.appleFailure(raw) { throw error }
         guard raw["jingleDocType"] != nil else { throw ToolError.message(AppText.text("未能获取免费应用许可，请先在 App Store 获取后重试")) }
@@ -516,8 +692,9 @@ final class AppleService: ObservableObject {
     /// A free app the account has never got is claimed first, as for iOS,
     /// unless `allowLicenseAcquisition` is false (version lists).
     func macPackageOffer(_ app: StoreApp, versionID requested: String? = nil, useCache: Bool,
-                         allowLicenseAcquisition: Bool = true, licenseAcquired: Bool = false) async throws -> MacPackageOffer {
-        guard let account = active else { throw ToolError.message(AppText.text("请先登录 Apple 账号")) }
+                         allowLicenseAcquisition: Bool = true, licenseAcquired: Bool = false,
+                         selectedCountry: String? = nil) async throws -> MacPackageOffer {
+        let account = try requireSignedInAccount()
         guard let appNumber = UInt64(app.id), appNumber > 0 else {
             throw ToolError.message(AppText.text("请输入有效的 Mac 应用 ID"))
         }
@@ -560,13 +737,21 @@ final class AppleService: ObservableObject {
         try Task.checkCancellation()
         guard activeID == initialID else { throw ToolError.message(AppText.text("账号已切换，请重新获取 Mac 下载信息")) }
         if AppleAuthError.requiresReauthentication(raw) { throw AppleAuthError.reauthenticationRequired }
-        if plistString(raw["failureType"]) == "9610" && !licenseAcquired {
+        let macFailure = plistString(raw["failureType"])
+        if macFailure == "9610" && !licenseAcquired {
             guard allowLicenseAcquisition else { throw AppleLicenseError.notOwned }
-            try await acquireFreeApp(app.id, account: account, mac: true, useCache: useCache)
+            try await acquireFreeApp(app.id, account: account, mac: true,
+                                     platform: .macOS, selectedCountry: selectedCountry, useCache: useCache)
             try Task.checkCancellation()
             guard activeID == initialID else { throw ToolError.message(AppText.text("账号已切换，请重新获取 Mac 下载信息")) }
             return try await macPackageOffer(app, versionID: versionID, useCache: useCache,
-                                             allowLicenseAcquisition: false, licenseAcquired: true)
+                                             allowLicenseAcquisition: false, licenseAcquired: true,
+                                             selectedCountry: selectedCountry)
+        }
+        if allowLicenseAcquisition,
+           let regionalError = await diagnoseStorefrontFailure(macFailure, appID: app.id, platform: .macOS,
+                                                               account: account, selectedCountry: selectedCountry) {
+            throw regionalError
         }
         if let error = HTTPClient.appleFailure(raw) { throw error }
         var offer: MacPackageOffer
@@ -580,8 +765,38 @@ final class AppleService: ObservableObject {
         return offer
     }
 
+    private func diagnoseStorefrontFailure(_ code: String, appID: String, platform: AppPlatform,
+                                           account: AppleAccount, selectedCountry: String?) async -> Error? {
+        guard code == "2059" || code == "1010" else { return nil }
+        let accountCountry = StoreService.country(forStorefront: account.storeFront)?.uppercased()
+        let storeCountry = selectedCountry?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        if let accountCountry, let storeCountry, !storeCountry.isEmpty, accountCountry != storeCountry {
+            return AppleStorefrontDownloadError(
+                reason: .accountRegionMismatch(accountRegion: accountCountry, storeRegion: storeCountry),
+                targetCountry: storeCountry
+            )
+        }
+        if let accountCountry,
+           (try? await StoreService.platformApp(appID, store: StoreContext(country: accountCountry, platform: platform))) == nil {
+            return AppleStorefrontDownloadError(
+                reason: .appUnavailableInAccountRegion(accountRegion: accountCountry),
+                targetCountry: nil
+            )
+        }
+        if code == "1010", let accountCountry {
+            return AppleStorefrontDownloadError(
+                reason: .appUnavailableInAccountRegion(accountRegion: accountCountry),
+                targetCountry: nil
+            )
+        }
+        return AppleStorefrontDownloadError(
+            reason: .temporarilyUnavailable(accountRegion: accountCountry),
+            targetCountry: storeCountry
+        )
+    }
+
     func ownedApps(useCache: Bool) async throws -> [OwnedApp] {
-        guard let account = active else { throw ToolError.message(AppText.text("请先登录 Apple 账号")) }
+        let account = try requireSignedInAccount()
         let base = "https://pd.itunes.apple.com/WebObjects/MZPurchaseDaap.woa/purchase"
         let query = "('com.apple.itunes.extended\\-media\\-kind:131072')"
         let headers = purchaseHeaders(account)
@@ -609,6 +824,328 @@ final class AppleService: ObservableObject {
             try DMAP.validate(items)
             return try DMAP.ownedApps(items)
         }.value
+    }
+
+    /// Reads Apple's Commerce Purchase History (`/commerce/account/purchases`) year by year,
+    /// returning historical, delisted, and sanctioned apps omitted by `MZPurchaseDaap`.
+    func commercePurchaseHistory(
+        sinceYear: Int,
+        throughYear: Int? = nil,
+        useCache: Bool = true,
+        allowSessionRefresh: Bool = false,
+        onYearProgress: (@Sendable (_ completedYears: Int, _ totalYears: Int) async -> Void)? = nil
+    ) async throws -> [OwnedApp] {
+        var account = try requireSignedInAccount()
+        let currentYear = throughYear ?? Calendar(identifier: .gregorian).component(.year, from: Date())
+        let startYear = max(2008, min(sinceYear, currentYear))
+        let years = Array((startYear...currentYear).reversed())
+        guard !years.isEmpty else { return [] }
+
+        var initialCookie = liveCookies[account.id] ?? account.cookie
+        var initialPod = commercePods[account.dsid] ?? CommercePurchaseHistory.pod(fromCookie: initialCookie) ?? ""
+        var storeFront = account.fullStoreFront.isEmpty ? account.storeFront : account.fullStoreFront
+        var dsid = account.dsid
+        var token = account.passwordToken
+        let accountID = account.id
+
+        // Run ONLY the initial page of the most recent year first so any 302 pod/cookie
+        // handshake (`itspod` + `mzcprh=1`) or 401/403 refresh settles in ~1 round-trip
+        // before fanning out remaining pages of the current year AND all older years in parallel.
+        let firstYear = years[0]
+        let firstPageFetch: CommerceFirstPageOutcome
+        do {
+            firstPageFetch = try await Self.fetchCommerceYearFirstPage(
+                year: firstYear, pod: initialPod, cookie: initialCookie,
+                dsid: dsid, storeFront: storeFront, passwordToken: token
+            )
+        } catch let status as HTTPStatusError where (status.code == 401 || status.code == 403) && allowSessionRefresh && !account.password.isEmpty {
+            account = try await refresh(account, useCache: useCache)
+            initialCookie = liveCookies[account.id] ?? account.cookie
+            initialPod = commercePods[account.dsid] ?? CommercePurchaseHistory.pod(fromCookie: initialCookie) ?? ""
+            storeFront = account.fullStoreFront.isEmpty ? account.storeFront : account.fullStoreFront
+            dsid = account.dsid
+            token = account.passwordToken
+            firstPageFetch = try await Self.fetchCommerceYearFirstPage(
+                year: firstYear, pod: initialPod, cookie: initialCookie,
+                dsid: dsid, storeFront: storeFront, passwordToken: token
+            )
+        }
+        guard activeID == accountID else { throw ToolError.message(AppText.text("账号已切换，请重新加载购买记录")) }
+        if !firstPageFetch.pod.isEmpty { commercePods[dsid] = firstPageFetch.pod }
+        if firstPageFetch.cookie != initialCookie, !firstPageFetch.cookie.isEmpty {
+            liveCookies[accountID] = firstPageFetch.cookie
+        }
+
+        var allApps = firstPageFetch.apps
+        let firstYearNeedsMore = !firstPageFetch.isComplete && firstPageFetch.newInvoiceCount > 0
+        var completed = firstYearNeedsMore ? 0 : 1
+        if completed > 0 { await onYearProgress?(completed, years.count) }
+
+        enum YearWork: Sendable {
+            case continueYear(year: Int, seenOrderIDs: Set<String>)
+            case fullYear(Int)
+        }
+        var workQueue: [YearWork] = []
+        if firstYearNeedsMore {
+            workQueue.append(.continueYear(year: firstYear, seenOrderIDs: firstPageFetch.seenOrderIDs))
+        }
+        for year in years.dropFirst() {
+            workQueue.append(.fullYear(year))
+        }
+
+        if !workQueue.isEmpty {
+            let settledPod = firstPageFetch.pod.isEmpty ? initialPod : firstPageFetch.pod
+            let settledCookie = firstPageFetch.cookie.isEmpty ? initialCookie : firstPageFetch.cookie
+            let totalYears = years.count
+            var latestPod = settledPod
+            var latestCookie = settledCookie
+
+            try await withThrowingTaskGroup(of: CommerceYearOutcome.self) { group in
+                var nextIndex = 0
+                let concurrency = min(6, workQueue.count)
+                func enqueue(_ work: YearWork, pod: String, cookie: String) {
+                    group.addTask {
+                        switch work {
+                        case .continueYear(let year, let seen):
+                            return try await Self.fetchCommerceYearRemainingPages(
+                                year: year, seenOrderIDs: seen, pod: pod, cookie: cookie,
+                                dsid: dsid, storeFront: storeFront, passwordToken: token
+                            )
+                        case .fullYear(let year):
+                            return try await Self.fetchCommerceYear(
+                                year: year, pod: pod, cookie: cookie,
+                                dsid: dsid, storeFront: storeFront, passwordToken: token
+                            )
+                        }
+                    }
+                }
+                while nextIndex < concurrency {
+                    enqueue(workQueue[nextIndex], pod: settledPod, cookie: settledCookie)
+                    nextIndex += 1
+                }
+                while let outcome = try await group.next() {
+                    try Task.checkCancellation()
+                    allApps.append(contentsOf: outcome.apps)
+                    if !outcome.pod.isEmpty { latestPod = outcome.pod }
+                    if !outcome.cookie.isEmpty { latestCookie = outcome.cookie }
+                    completed += 1
+                    await onYearProgress?(completed, totalYears)
+                    if nextIndex < workQueue.count {
+                        enqueue(workQueue[nextIndex], pod: latestPod, cookie: latestCookie)
+                        nextIndex += 1
+                    }
+                }
+            }
+            guard activeID == accountID else { throw ToolError.message(AppText.text("账号已切换，请重新加载购买记录")) }
+            if !latestPod.isEmpty { commercePods[dsid] = latestPod }
+            if latestCookie != initialCookie, !latestCookie.isEmpty {
+                liveCookies[accountID] = latestCookie
+            }
+        }
+        saveLiveCookies()
+        return allApps
+    }
+
+    private struct CommerceFirstPageOutcome: Sendable {
+        let apps: [OwnedApp]
+        let isComplete: Bool
+        let newInvoiceCount: Int
+        let seenOrderIDs: Set<String>
+        let pod: String
+        let cookie: String
+    }
+
+    private struct CommerceYearOutcome: Sendable {
+        let apps: [OwnedApp]
+        let pod: String
+        let cookie: String
+    }
+
+    nonisolated private static func commerceURL(pod: String, page: Int?, range: String) -> URL? {
+        let host = pod.isEmpty ? "buy.itunes.apple.com" : "p\(pod)-buy.itunes.apple.com"
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = host
+        components.path = "/commerce/account/purchases"
+        var items = [
+            URLQueryItem(name: "isDeepLink", value: "false"),
+            URLQueryItem(name: "isJsonApiFormat", value: "true")
+        ]
+        if let page, page > 0 {
+            items.append(URLQueryItem(name: "page", value: String(page)))
+        }
+        items.append(URLQueryItem(name: "range", value: range))
+        components.queryItems = items
+        return components.url
+    }
+
+    nonisolated private static func commerceHeaders(cookie: String, dsid: String, storeFront: String, passwordToken: String) -> [String: String] {
+        var headers: [String: String] = [
+            "User-Agent": HTTPClient.userAgent,
+            "Accept-Language": "en-us",
+            "X-Dsid": dsid
+        ]
+        if !storeFront.isEmpty { headers["X-Apple-Store-Front"] = storeFront }
+        if !cookie.isEmpty { headers["Cookie"] = cookie }
+        if !passwordToken.isEmpty { headers["X-Token"] = passwordToken }
+        return headers
+    }
+
+    nonisolated private static func absorbResponseCookies(from response: HTTPURLResponse, into existing: String) -> String {
+        guard let url = response.url else { return existing }
+        var fields: [String: String] = [:]
+        for (key, value) in response.allHeaderFields { fields[String(describing: key)] = String(describing: value) }
+        let received = HTTPCookie.cookies(withResponseHeaderFields: fields, for: url)
+        guard !received.isEmpty else { return existing }
+        return mergedCookie(existing, with: received)
+    }
+
+    nonisolated private static func capturePod(from response: HTTPURLResponse, current: String) -> String {
+        if let headerPod = response.value(forHTTPHeaderField: "pod")?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !headerPod.isEmpty, headerPod.allSatisfy({ $0.isASCII && $0.isNumber }) {
+            return headerPod
+        }
+        if let location = response.value(forHTTPHeaderField: "Location"),
+           let url = URL(string: location, relativeTo: response.url)?.absoluteURL,
+           let host = url.host,
+           let parsed = CommercePurchaseHistory.pod(fromHost: host) {
+            return parsed
+        }
+        if let host = response.url?.host, let parsed = CommercePurchaseHistory.pod(fromHost: host) {
+            return parsed
+        }
+        return current
+    }
+
+    nonisolated private static func fetchCommercePage(
+        year: Int, page: Int?, pod initialPod: String, cookie initialCookie: String,
+        dsid: String, storeFront: String, passwordToken: String
+    ) async throws -> (data: Data, pod: String, cookie: String) {
+        let range = "\(year)-all"
+        var pod = initialPod
+        var cookie = initialCookie
+
+        guard var currentURL = commerceURL(pod: pod, page: page, range: range) else {
+            throw ToolError.message(AppText.text("链接无效"))
+        }
+
+        func send(_ url: URL) async throws -> (Data, HTTPURLResponse) {
+            try await HTTPClient.shared.rawRequest(
+                url, method: "GET",
+                headers: commerceHeaders(cookie: cookie, dsid: dsid, storeFront: storeFront, passwordToken: passwordToken),
+                timeoutInterval: 30
+            )
+        }
+
+        var responsePair: (Data, HTTPURLResponse)
+        do {
+            responsePair = try await send(currentURL)
+            if !pod.isEmpty && (responsePair.1.statusCode == 404 || (500...599).contains(responsePair.1.statusCode)),
+               let fallback = commerceURL(pod: "", page: page, range: range) {
+                currentURL = fallback
+                responsePair = try await send(fallback)
+            }
+        } catch {
+            guard !pod.isEmpty, !Task.isCancelled,
+                  let fallback = commerceURL(pod: "", page: page, range: range) else { throw error }
+            currentURL = fallback
+            responsePair = try await send(fallback)
+        }
+
+        var (data, http) = responsePair
+        cookie = absorbResponseCookies(from: http, into: cookie)
+        pod = capturePod(from: http, current: pod)
+
+        // Follow up to 4 302 hops verbatim so Apple's `mzcprh=1` + `itspod` handshake succeeds.
+        for _ in 0..<4 where [301, 302, 303, 307, 308].contains(http.statusCode) {
+            try Task.checkCancellation()
+            guard let location = http.value(forHTTPHeaderField: "Location"),
+                  let next = URL(string: location, relativeTo: currentURL)?.absoluteURL,
+                  next.scheme?.lowercased() == "https",
+                  let host = next.host?.lowercased(),
+                  next.user == nil, next.password == nil,
+                  host == "itunes.apple.com" || host.hasSuffix(".itunes.apple.com") else {
+                throw ToolError.message(AppText.text("服务器响应异常，请稍后重试"))
+            }
+            currentURL = next
+            (data, http) = try await send(next)
+            cookie = absorbResponseCookies(from: http, into: cookie)
+            pod = capturePod(from: http, current: pod)
+        }
+
+        guard (200..<300).contains(http.statusCode) else {
+            let cookieNames = cookie.split(separator: ";").compactMap { part -> String? in
+                let trimmed = part.trimmingCharacters(in: .whitespaces)
+                guard let eq = trimmed.firstIndex(of: "=") else { return nil }
+                return String(trimmed[..<eq])
+            }.joined(separator: ",")
+            InstallLog.shared.add("commerce-purchases HTTP \(http.statusCode) host=\(currentURL.host ?? "?") pod=\(pod.isEmpty ? "-" : pod) cookies=[\(cookieNames)] bytes=\(data.count)")
+            RequestFailureLog.record(currentURL, status: http.statusCode, stage: "commerce-purchases")
+            throw HTTPStatusError(code: http.statusCode)
+        }
+        return (data, pod, cookie)
+    }
+
+    nonisolated private static func fetchCommerceYearFirstPage(
+        year: Int, pod initialPod: String, cookie initialCookie: String,
+        dsid: String, storeFront: String, passwordToken: String
+    ) async throws -> CommerceFirstPageOutcome {
+        var seenOrderIDs = Set<String>()
+        let initial = try await fetchCommercePage(
+            year: year, page: nil, pod: initialPod, cookie: initialCookie,
+            dsid: dsid, storeFront: storeFront, passwordToken: passwordToken
+        )
+        let firstPage = try CommercePurchaseHistory.parsePage(initial.data, seenOrderIDs: &seenOrderIDs)
+        return CommerceFirstPageOutcome(
+            apps: firstPage.apps,
+            isComplete: firstPage.isComplete,
+            newInvoiceCount: firstPage.newInvoiceCount,
+            seenOrderIDs: seenOrderIDs,
+            pod: initial.pod,
+            cookie: initial.cookie
+        )
+    }
+
+    nonisolated private static func fetchCommerceYearRemainingPages(
+        year: Int, seenOrderIDs initialSeen: Set<String>,
+        pod initialPod: String, cookie initialCookie: String,
+        dsid: String, storeFront: String, passwordToken: String
+    ) async throws -> CommerceYearOutcome {
+        var pod = initialPod
+        var cookie = initialCookie
+        var apps: [OwnedApp] = []
+        var seenOrderIDs = initialSeen
+        for page in 2...1000 {
+            try Task.checkCancellation()
+            let fetched = try await fetchCommercePage(
+                year: year, page: page, pod: pod, cookie: cookie,
+                dsid: dsid, storeFront: storeFront, passwordToken: passwordToken
+            )
+            pod = fetched.pod
+            cookie = fetched.cookie
+            let parsed = try CommercePurchaseHistory.parsePage(fetched.data, seenOrderIDs: &seenOrderIDs)
+            apps.append(contentsOf: parsed.apps)
+            if parsed.isComplete || parsed.newInvoiceCount == 0 { break }
+        }
+        return CommerceYearOutcome(apps: apps, pod: pod, cookie: cookie)
+    }
+
+    nonisolated private static func fetchCommerceYear(
+        year: Int, pod initialPod: String, cookie initialCookie: String,
+        dsid: String, storeFront: String, passwordToken: String
+    ) async throws -> CommerceYearOutcome {
+        let first = try await fetchCommerceYearFirstPage(
+            year: year, pod: initialPod, cookie: initialCookie,
+            dsid: dsid, storeFront: storeFront, passwordToken: passwordToken
+        )
+        guard !first.isComplete && first.newInvoiceCount > 0 else {
+            return CommerceYearOutcome(apps: first.apps, pod: first.pod, cookie: first.cookie)
+        }
+        let rest = try await fetchCommerceYearRemainingPages(
+            year: year, seenOrderIDs: first.seenOrderIDs, pod: first.pod, cookie: first.cookie,
+            dsid: dsid, storeFront: storeFront, passwordToken: passwordToken
+        )
+        return CommerceYearOutcome(apps: first.apps + rest.apps, pod: rest.pod, cookie: rest.cookie)
     }
 
     private func storePlist(_ url: URL, body: Data, headers: [String: String], guid: String,
@@ -807,6 +1344,31 @@ struct MacPackageOffer {
     }
 }
 
+struct AppleStorefrontDownloadError: LocalizedError, Equatable {
+    enum Reason: Equatable {
+        case accountRegionMismatch(accountRegion: String, storeRegion: String)
+        case appUnavailableInAccountRegion(accountRegion: String)
+        case temporarilyUnavailable(accountRegion: String?)
+    }
+
+    let reason: Reason
+    let targetCountry: String?
+
+    var errorDescription: String? {
+        switch reason {
+        case .accountRegionMismatch(let accountRegion, let storeRegion):
+            let accountLabel = StoreRegions.name(accountRegion)
+            let storeLabel = StoreRegions.name(storeRegion)
+            return AppText.text("账号地区（\(accountLabel)）与搜索地区（\(storeLabel)）不一致，请切换账号或搜索地区后再试。")
+        case .appUnavailableInAccountRegion(let accountRegion):
+            let accountLabel = StoreRegions.name(accountRegion)
+            return AppText.text("此应用在账号地区（\(accountLabel)）不可用，请更换对应地区账号后再试。")
+        case .temporarilyUnavailable:
+            return AppText.text("该应用暂时无法下载，请稍后再试或切换对应地区账号。")
+        }
+    }
+}
+
 enum AppleLicenseError: LocalizedError {
     case notOwned
     var errorDescription: String? {
@@ -883,7 +1445,7 @@ enum AppleLoginResponse {
 extension AppleService {
     func prepareAccountPreview() {
         accountStorageError = nil
-        accounts = [AppleAccount(id: "demo@example.com", name: PreviewData.chinese ? "示例账号" : "Alex Morgan", password: "", cookie: "", dsid: "", passwordToken: "", storeFront: "", fullStoreFront: ""), AppleAccount(id: "second@example.com", name: PreviewData.chinese ? "另一个账号" : "Sam Lee", password: "", cookie: "", dsid: "", passwordToken: "", storeFront: "", fullStoreFront: "")]
+        accounts = [AppleAccount(id: "demo@example.com", name: PreviewData.chinese ? "示例账号" : "Alex Morgan", password: "", cookie: "", dsid: "100000001", passwordToken: "preview-session", storeFront: "", fullStoreFront: ""), AppleAccount(id: "second@example.com", name: PreviewData.chinese ? "另一个账号" : "Sam Lee", password: "", cookie: "", dsid: "100000002", passwordToken: "preview-session", storeFront: "", fullStoreFront: "")]
         activeID = accounts.first?.id
     }
 }

@@ -13,7 +13,8 @@ struct PackageInfo: Equatable {
     struct Extension: Equatable, Identifiable {
         var name: String
         var point: String
-        var id: String { point + "|" + name }
+        var path: String = ""
+        var id: String { path.isEmpty ? (point + "|" + name) : path }
     }
     var name = ""
     var bundleID = ""
@@ -47,6 +48,11 @@ enum PackageInfoService {
         for entry in archive where entry.path.hasPrefix(prefix) { paths.append(String(entry.path.dropFirst(prefix.count))) }
 
         var info = describe(plist)
+        let metadata: [String: Any]
+        if let entry = archive["iTunesMetadata.plist"] { metadata = (try? readPlist(entry, archive: archive)) ?? [:] }
+        else { metadata = [:] }
+        let localizedName = PackageService.localizedBundleDisplayName(in: archive, appPrefix: prefix, basePlist: plist, metadata: metadata)
+        if !localizedName.isEmpty { info.name = localizedName }
         info.devices = PackageService.describePlatforms(families: Set(plist["UIDeviceFamily"] as? [Int] ?? []),
                                                         platforms: Set(plist["CFBundleSupportedPlatforms"] as? [String] ?? []))
         info.languages = languages(in: paths)
@@ -59,14 +65,20 @@ enum PackageInfoService {
         info.frameworks = info.frameworkNames.count
         info.packageSize = ((try? FileManager.default.attributesOfItem(atPath: url.path)[.size]) as? NSNumber)?.int64Value ?? 0
         // Extensions: PlugIns/*.appex and Extensions/*.appex, each with its own Info.plist.
-        for path in paths where isExtensionInfo(path) {
+        var seenExtensionPaths = Set<String>()
+        for path in paths where isExtensionInfo(path) && seenExtensionPaths.insert(path).inserted {
             guard let entry = archive[prefix + path], let extensionPlist = try? readPlist(entry, archive: archive) else { continue }
             let point = plistString((extensionPlist["NSExtension"] as? [String: Any])?["NSExtensionPointIdentifier"]
                                     ?? (extensionPlist["EXAppExtensionAttributes"] as? [String: Any])?["EXExtensionPointIdentifier"])
             let name = plistString(extensionPlist["CFBundleDisplayName"] ?? extensionPlist["CFBundleName"])
-            info.extensions.append(.init(name: name.isEmpty ? String(path.split(separator: "/")[1].dropLast(".appex".count)) : name, point: point))
+            let bundleRelativePath = String(path.dropLast("/Info.plist".count))
+            info.extensions.append(.init(
+                name: name.isEmpty ? String(path.split(separator: "/")[1].dropLast(".appex".count)) : name,
+                point: point,
+                path: bundleRelativePath
+            ))
         }
-        info.extensions.sort { ($0.point, $0.name) < ($1.point, $1.name) }
+        info.extensions.sort { ($0.point, $0.name, $0.path) < ($1.point, $1.name, $1.path) }
         return info
     }
 

@@ -19,6 +19,59 @@ final class InteractionTests: XCTestCase {
         link.tap()
     }
 
+    func testTranslationSettingsAreOptInAndDoNotDownloadOnEnable() throws {
+        guard #available(iOS 18.0, *) else { throw XCTSkip("Direct translation requires iOS 18") }
+        let app = Self.launchableApp()
+        app.launchArguments += ["--visual-preview", "--accounts"]
+        func switchControl(for toggle: XCUIElement) -> XCUIElement {
+            let inner = toggle.switches.firstMatch
+            return inner.exists ? inner : toggle
+        }
+        func isClearOfBars(_ element: XCUIElement) -> Bool {
+            guard element.exists else { return false }
+            let winH = app.windows.firstMatch.frame.height
+            let frame = element.frame
+            guard winH > 0, frame.height > 0 else { return element.isHittable }
+            return element.isHittable && frame.minY > 110 && frame.maxY < winH - 130
+        }
+        func openTranslationGroup() {
+            let settings = app.buttons["accounts.settings"]
+            for _ in 0..<4 { if settings.exists && settings.isHittable { break }; app.swipeUp() }
+            XCTAssertTrue(settings.waitForExistence(timeout: 10)); settings.tap()
+            XCTAssertFalse(app.buttons["settings.page.translation"].exists, "Translation must not add another settings page")
+            openSettingsPage("appearance", in: app)
+            let toggle = app.switches["settings.translation.direct"]
+            for _ in 0..<6 { if isClearOfBars(switchControl(for: toggle)) { break }; app.swipeUp() }
+            XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        }
+        app.launch()
+        openTranslationGroup()
+        let direct = app.switches["settings.translation.direct"]
+        if direct.value as? String == "1" {
+            switchControl(for: direct).tap()
+            let resetOff = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: direct)
+            _ = XCTWaiter.wait(for: [resetOff], timeout: 3)
+        }
+        XCTAssertFalse(app.buttons["settings.translation.prepare"].exists)
+        for _ in 0..<4 { if isClearOfBars(switchControl(for: direct)) { break }; app.swipeUp() }
+        switchControl(for: direct).tap()
+        let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '1'"), object: direct)
+        XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 3), .completed, "Tapping the switch control must enable direct translation")
+        let status = app.descendants(matching: .any)["settings.translation.status"].firstMatch
+        for _ in 0..<4 { if status.exists && status.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(status.waitForExistence(timeout: 15))
+        XCTAssertFalse(app.staticTexts["所需下载"].exists, "Enabling only checks availability; download requires an explicit tap")
+        for _ in 0..<4 { if isClearOfBars(switchControl(for: direct)) { break }; app.swipeDown() }
+        switchControl(for: direct).tap()
+        let disabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: direct)
+        XCTAssertEqual(XCTWaiter.wait(for: [disabled], timeout: 3), .completed, "Tapping the switch control must disable direct translation")
+        app.terminate()
+        app.launch()
+        openTranslationGroup()
+        XCTAssertEqual(direct.value as? String, "0", "The user's mode choice must persist")
+        XCTAssertFalse(app.buttons["settings.translation.prepare"].exists)
+    }
+
     func testAppIDIsAlignedWithVersionInDetailHeader() {
         let app = Self.launchableApp()
         app.launchArguments = Self.languageArguments + ["--visual-preview", "--detail"]
@@ -387,6 +440,16 @@ final class InteractionTests: XCTestCase {
         XCTAssertTrue(delete.waitForExistence(timeout: 5))
         attach("10-download-swipe", app: app)
         delete.tap()
+        // Swipe removes immediately and offers Undo, without confirmation.
+        let undo = app.buttons["notice.undo"]
+        XCTAssertTrue(undo.waitForExistence(timeout: 5))
+        undo.tap()
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["confirmation.confirm"].exists)
+        row.press(forDuration: 0.7)
+        let longDelete = app.buttons["删除任务及文件"].firstMatch
+        XCTAssertTrue(longDelete.waitForExistence(timeout: 5))
+        longDelete.tap()
         let cancel = app.buttons["confirmation.cancel"]
         XCTAssertTrue(cancel.waitForExistence(timeout: 5))
         let confirm = app.buttons["confirmation.confirm"]
@@ -397,7 +460,7 @@ final class InteractionTests: XCTestCase {
         attach("12-delete-confirmation", app: app)
         cancel.tap()
         XCTAssertTrue(row.waitForExistence(timeout: 5))
-        revealActions(on: row); delete.tap()
+        row.press(forDuration: 0.7); longDelete.tap()
         XCTAssertTrue(confirm.waitForExistence(timeout: 5)); confirm.tap()
         let notice = app.staticTexts["已删除 1 项任务与文件"]
         XCTAssertTrue(notice.waitForExistence(timeout: 5))
@@ -411,11 +474,17 @@ final class InteractionTests: XCTestCase {
         app.launchArguments = Self.languageArguments + ["--visual-preview", "--history-wrap-preview"]
         app.launch()
         let first = app.buttons["history.效率工具"]
-        let lower = app.buttons["history.Apple Music"]
+        let last = app.buttons["history.@"]
         XCTAssertTrue(first.waitForExistence(timeout: 10))
-        XCTAssertTrue(lower.waitForExistence(timeout: 5))
-        let upperFrame = first.frame, lowerFrame = lower.frame
-        XCTAssertGreaterThan(lowerFrame.minY, upperFrame.maxY, "The fixture must wrap to exercise both grouped-cell corners")
+        XCTAssertTrue(last.waitForExistence(timeout: 5))
+        let upperFrame = first.frame
+        let wrappedCandidates = ["history.照片编辑", "history.Apple Music", "history.@"].map { app.buttons[$0] }
+        guard let lower = wrappedCandidates.first(where: {
+            $0.exists && $0.frame.minY > upperFrame.maxY && abs($0.frame.minX - upperFrame.minX) < 2
+        }) else {
+            return XCTFail("The fixture must wrap to exercise both grouped-cell corners")
+        }
+        let lowerFrame = lower.frame
         let screenshot = app.screenshot()
         for (frame, fraction) in [(upperFrame, CGFloat(0.22)), (lowerFrame, CGFloat(0.78))] {
             // Just inside each capsule arc, but outside the old cell mask.
@@ -571,21 +640,40 @@ final class InteractionTests: XCTestCase {
         pickerCancel.tap()
         XCTAssertTrue(add.waitForExistence(timeout: 5))
     }
-    func testHistoryDeletionCanBeUndone() {
+    func testHistoryDeletionHasNoUndoCountdown() {
         let app = Self.launchableApp()
         app.launchArguments = Self.languageArguments + ["--visual-preview"]
         app.launch()
         let history = app.buttons["history.效率工具"]
         XCTAssertTrue(history.waitForExistence(timeout: 10))
         history.press(forDuration: 1.0)
-        XCTAssertTrue(app.buttons["删除"].firstMatch.waitForExistence(timeout: 5))
-        app.buttons["删除"].firstMatch.tap()
-        // Undo expires after five seconds. Snapshotting the whole history
-        // before tapping can consume that window on a busy simulator.
-        // tap() already resolves/waits for the button; restoration is checked
-        // afterwards, without changing the app's real expiry duration.
-        app.buttons["notice.undo"].tap()
-        XCTAssertTrue(history.waitForExistence(timeout: 5))
+        let delete = app.buttons["删除"].firstMatch
+        XCTAssertTrue(delete.waitForExistence(timeout: 5))
+        delete.tap()
+        let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: history)
+        XCTAssertEqual(XCTWaiter.wait(for: [gone], timeout: 5), .completed)
+        XCTAssertFalse(app.buttons["notice.undo"].exists)
+    }
+
+    func testFullDownloadSwipeDeletesWithoutConfirmationAndUndoRestores() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--downloads", "--stress-records=100"]
+        app.launch()
+        let row = app.descendants(matching: .any)["download.task.stress-0.paused"].firstMatch
+        XCTAssertTrue(row.waitForExistence(timeout: 10))
+        row.coordinate(withNormalizedOffset: CGVector(dx: 0.15, dy: 0.5))
+            .press(forDuration: 0.05, thenDragTo: row.coordinate(withNormalizedOffset: CGVector(dx: 0.99, dy: 0.5)))
+        let undo = app.buttons["notice.undo"]
+        XCTAssertTrue(undo.waitForExistence(timeout: 5))
+        undo.tap()
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
+        XCTAssertFalse(app.buttons["confirmation.confirm"].exists)
+        // Existence alone misses a stale transparent window overlay: prove a
+        // real toolbar tap still reaches the restored list after Undo.
+        app.buttons["downloads.edit"].tap()
+        XCTAssertTrue(app.buttons["downloads.select-all"].waitForExistence(timeout: 5))
+        app.buttons["downloads.edit"].tap()
+        XCTAssertTrue(row.waitForExistence(timeout: 5))
     }
 
     func testCompactNoticeAndAccessibleConfirmation() {
@@ -756,6 +844,201 @@ final class InteractionTests: XCTestCase {
         XCTAssertTrue(details.waitForExistence(timeout: 5))
         details.tap()
         XCTAssertTrue(app.navigationBars["任务详情"].waitForExistence(timeout: 5))
+    }
+
+    func testPrioritizeDelistedSearchToggleDefaultOnAndTogglesCleanly() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        app.launch()
+        let settings = app.buttons["accounts.settings"]
+        XCTAssertTrue(settings.waitForExistence(timeout: 10)); settings.tap()
+        openSettingsPage("downloads", in: app)
+        let toggle = app.switches["settings.prioritize-delisted-search"]
+        for _ in 0..<5 { if toggle.exists && toggle.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        XCTAssertEqual(toggle.value as? String, "1", "Prioritize delisted apps toggle must default to ON")
+        let target = toggle.switches.firstMatch.exists ? toggle.switches.firstMatch : toggle
+        target.tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        target.tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.terminate()
+    }
+
+    func testAppDetailScreenshotsToggleDefaultOnAndPersists() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        func openAppearance() {
+            let settings = app.buttons["accounts.settings"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 10)); settings.tap()
+            openSettingsPage("appearance", in: app)
+        }
+        app.launch()
+        openAppearance()
+        let toggle = app.switches["settings.show-screenshots"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        XCTAssertEqual(toggle.value as? String, "1")
+        let control = toggle.switches.firstMatch.exists ? toggle.switches.firstMatch : toggle
+        control.tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        app.terminate()
+
+        app.launch()
+        openAppearance()
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        XCTAssertEqual(toggle.value as? String, "0")
+        let restore = toggle.switches.firstMatch.exists ? toggle.switches.firstMatch : toggle
+        restore.tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.terminate()
+    }
+
+    func testAppDetailReviewsToggleDefaultOnPersistsAndHidesCard() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        func openAppearance() {
+            let settings = app.buttons["accounts.settings"]
+            XCTAssertTrue(settings.waitForExistence(timeout: 10)); settings.tap()
+            openSettingsPage("appearance", in: app)
+        }
+        app.launch()
+        openAppearance()
+        let toggle = app.switches["settings.show-reviews"]
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        XCTAssertEqual(toggle.value as? String, "1")
+        let control = toggle.switches.firstMatch.exists ? toggle.switches.firstMatch : toggle
+        control.tap()
+        XCTAssertEqual(toggle.value as? String, "0")
+        app.terminate()
+
+        // Launch detail view directly with reviews disabled and verify ReviewsCard is not mounted.
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--detail"]
+        app.launch()
+        XCTAssertTrue(app.buttons["app.copy-id"].waitForExistence(timeout: 10))
+        for _ in 0..<2 { app.swipeUp() }
+        XCTAssertFalse(app.descendants(matching: .any)["detail.reviews"].firstMatch.exists)
+        app.terminate()
+
+        // Restore default ON and verify ReviewsCard is shown again.
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        app.launch()
+        openAppearance()
+        XCTAssertTrue(toggle.waitForExistence(timeout: 10))
+        XCTAssertEqual(toggle.value as? String, "0")
+        let restore = toggle.switches.firstMatch.exists ? toggle.switches.firstMatch : toggle
+        restore.tap()
+        XCTAssertEqual(toggle.value as? String, "1")
+        app.terminate()
+
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--detail"]
+        app.launch()
+        let reviewsLink = app.descendants(matching: .any)["detail.reviews"].firstMatch
+        for _ in 0..<4 { if reviewsLink.exists { break }; app.swipeUp() }
+        XCTAssertTrue(reviewsLink.waitForExistence(timeout: 10))
+        app.terminate()
+    }
+
+    func testAccountsPageExposesProfileBackupActions() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        app.launch()
+        XCTAssertFalse(app.buttons["accounts.export-profiles"].exists)
+        XCTAssertFalse(app.buttons["accounts.import-profiles"].exists)
+
+        let settings = app.buttons["accounts.settings"]
+        for _ in 0..<4 { if settings.exists { break }; app.swipeUp() }
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        settings.tap()
+
+        let maintenance = app.buttons["settings.page.maintenance"]
+        XCTAssertTrue(maintenance.waitForExistence(timeout: 10))
+        maintenance.tap()
+
+        let exportButton = app.buttons["settings.export-backup"]
+        let importButton = app.buttons["settings.import-backup"]
+        XCTAssertTrue(exportButton.waitForExistence(timeout: 10))
+        XCTAssertTrue(importButton.waitForExistence(timeout: 5))
+        XCTAssertTrue(exportButton.isEnabled)
+        XCTAssertTrue(importButton.isEnabled)
+        app.terminate()
+    }
+
+    func testProModeTogglePreservesSettingsNavigationAndReentry() {
+        func switchControl(for toggle: XCUIElement) -> XCUIElement {
+            let inner = toggle.switches.firstMatch
+            return inner.exists ? inner : toggle
+        }
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        app.launch()
+
+        let settings = app.buttons["accounts.settings"]
+        _ = app.windows.firstMatch.waitForExistence(timeout: 10)
+        for _ in 0..<4 { if settings.exists && settings.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(settings.waitForExistence(timeout: 10))
+        settings.tap()
+
+        let proToggle = app.switches["settings.pro-mode"]
+        for _ in 0..<5 { if proToggle.exists && switchControl(for: proToggle).isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(proToggle.waitForExistence(timeout: 10))
+        if proToggle.value as? String == "1" {
+            switchControl(for: proToggle).tap()
+            let offFirst = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: proToggle)
+            _ = XCTWaiter.wait(for: [offFirst], timeout: 3)
+        }
+        switchControl(for: proToggle).tap()
+        let enabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '1'"), object: proToggle)
+        XCTAssertEqual(XCTWaiter.wait(for: [enabled], timeout: 3), .completed)
+
+        let credentials = app.buttons["settings.credentials"]
+        for _ in 0..<3 { if credentials.exists && credentials.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(credentials.waitForExistence(timeout: 5))
+        credentials.tap()
+        XCTAssertTrue(app.buttons["pro.edit-device"].waitForExistence(timeout: 5))
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        XCTAssertTrue(proToggle.waitForExistence(timeout: 5))
+
+        app.navigationBars.buttons.element(boundBy: 0).tap()
+        for _ in 0..<4 { if settings.exists && settings.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(settings.waitForExistence(timeout: 5))
+        settings.tap()
+        XCTAssertTrue(app.buttons["settings.page.downloads"].waitForExistence(timeout: 5))
+
+        for _ in 0..<5 { if proToggle.exists && switchControl(for: proToggle).isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(proToggle.waitForExistence(timeout: 5))
+        switchControl(for: proToggle).tap()
+        let disabled = XCTNSPredicateExpectation(predicate: NSPredicate(format: "value == '0'"), object: proToggle)
+        XCTAssertEqual(XCTWaiter.wait(for: [disabled], timeout: 3), .completed)
+        app.terminate()
+    }
+
+    func testAccountsInstalledAppsSubNavigationPushesCleanly() {
+        let app = Self.launchableApp()
+        app.launchArguments = Self.languageArguments + ["--visual-preview", "--accounts"]
+        app.launch()
+
+        _ = app.windows.firstMatch.waitForExistence(timeout: 10)
+        let installedApps = app.buttons["accounts.installed-apps"]
+        if installedApps.exists {
+            for _ in 0..<4 { if installedApps.isHittable { break }; app.swipeUp() }
+            installedApps.tap()
+            XCTAssertTrue(app.navigationBars["本机应用"].waitForExistence(timeout: 5))
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+        }
+
+        let settings = app.buttons["accounts.settings"]
+        for _ in 0..<4 { if settings.exists && settings.isHittable { break }; app.swipeUp() }
+        XCTAssertTrue(settings.waitForExistence(timeout: 8))
+        settings.tap()
+
+        openSettingsPage("sources", in: app)
+        let firstSource = app.buttons.matching(NSPredicate(format: "label CONTAINS 'Timbrd'")).firstMatch
+        if firstSource.waitForExistence(timeout: 5) {
+            firstSource.tap()
+            XCTAssertTrue(app.navigationBars["Timbrd"].waitForExistence(timeout: 5))
+            app.navigationBars.buttons.element(boundBy: 0).tap()
+        }
+        app.terminate()
     }
 
     private func revealActions(on element: XCUIElement) {

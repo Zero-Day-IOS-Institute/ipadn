@@ -5,6 +5,8 @@ import UIKit
 /// The version number, date and package size of one App Store version, read from the
 /// package itself (ipatool's get-version-metadata).
 struct VersionMetadata: Codable, Hashable, Sendable {
+    static let currentSchema = 4
+
     var version: String
     var released: Date?
     /// nil in legacy caches; those dates must also be treated as approximate.
@@ -14,6 +16,22 @@ struct VersionMetadata: Codable, Hashable, Sendable {
     var packageSize: Int64? = nil
     /// nil: not checked/retryable; false: no readable primary PNG; true: cached PNG.
     var iconAvailable: Bool? = nil
+    /// nil in legacy caches; ensures dotless versions written solely from IPA Info.plist
+    /// are reconciled once against Apple's DownloadDispatch ticket metadata.
+    var ticketChecked: Bool? = nil
+    /// nil in legacy caches created before stale latest-version fallback filtering.
+    var metadataSchema: Int? = nil
+    /// Raw `Info.plist` `CFBundleShortVersionString`, preserved separately from the
+    /// App Store public marketing version (e.g. `10.0.22` when Store says `1.9.5`).
+    var bundleShortVersion: String? = nil
+    /// Raw `Info.plist` `CFBundleVersion` build number (e.g. `80`, `48000`).
+    var buildVersion: String? = nil
+
+    /// True when an older build cached `iconAvailable == false` after `RemoteZip` failed
+    /// before reading `Info.plist` (leaving both `released` and `buildVersion` nil).
+    var hasUnverifiedMissingIcon: Bool {
+        iconAvailable == false && released == nil && buildVersion == nil && ticketChecked == true
+    }
 }
 
 /// Reads byte ranges of a remote file.
@@ -67,22 +85,44 @@ enum RemoteZip {
     }
 
     static func versionResources(_ reader: RangeReader, includingIcon: Bool = true,
+                                 preferredVersion: String? = nil,
                                  onMetadata: (@Sendable (VersionMetadata) async -> Void)? = nil) async throws
         -> (metadata: VersionMetadata, icon: Data?) {
-        let (entries, size) = try await centralDirectory(reader)
+        let (entries, size) = try await centralDirectory(reader, filterForVersionResources: true)
         guard let entry = entries.first(where: { isMainInfoPlist($0.name) }) else { throw Failure.notFound }
         let data = try await contents(of: entry, fileSize: size, reader: reader)
         guard let plist = try PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any] else {
             throw Failure.unreadable
         }
-        let version = plistString(plist["CFBundleShortVersionString"] ?? plist["bundleShortVersionString"])
+        let rawShort = plistString(plist["CFBundleShortVersionString"] ?? plist["bundleShortVersionString"])
             .trimmingCharacters(in: .whitespacesAndNewlines)
+        let rawBuild = plistString(plist["CFBundleVersion"] ?? plist["bundleVersion"])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let plistCandidate = VersionService.reconcileTicketVersion(shortVersion: rawShort, buildVersion: rawBuild)
+        let sanitizedPlist = VersionService.sanitizedVersion(plistCandidate)
+        let plistScore = VersionService.versionPreference(sanitizedPlist)
+        let sanitizedPref = preferredVersion.map { VersionService.sanitizedVersion($0) } ?? AppVersion.unknown
+        let prefScore = VersionService.versionPreference(sanitizedPref)
+        let version: String
+        if prefScore > plistScore {
+            version = sanitizedPref
+        } else if sanitizedPlist != AppVersion.unknown {
+            version = sanitizedPlist
+        } else if sanitizedPref != AppVersion.unknown {
+            version = sanitizedPref
+        } else {
+            version = !rawShort.isEmpty ? rawShort : rawBuild
+        }
         guard !version.isEmpty else { throw Failure.unreadable }
         let explicitDate = releaseDate(plist["releaseDate"] ?? plist["ReleaseDate"])
         var metadata = VersionMetadata(version: version,
                                        released: explicitDate ?? entry.modified,
                                        releaseDateIsEstimated: explicitDate == nil,
-                                       packageSize: size)
+                                       packageSize: size,
+                                       ticketChecked: preferredVersion != nil ? true : nil,
+                                       metadataSchema: VersionMetadata.currentSchema,
+                                       bundleShortVersion: rawShort.isEmpty ? nil : rawShort,
+                                       buildVersion: rawBuild.isEmpty ? nil : rawBuild)
         await onMetadata?(metadata)
         try Task.checkCancellation()
         var icon: Data?
@@ -148,7 +188,7 @@ enum RemoteZip {
         return nil
     }
 
-    static func centralDirectory(_ reader: RangeReader) async throws -> (entries: [Entry], size: Int64) {
+    static func centralDirectory(_ reader: RangeReader, filterForVersionResources: Bool = false) async throws -> (entries: [Entry], size: Int64) {
         // End record (22 bytes) plus the longest possible comment.
         let (fetched, size) = try await reader.tail(22 + 65_535)
         let tail = Data(fetched)
@@ -183,12 +223,45 @@ enum RemoteZip {
         } else {
             directory = try await reader.read(offset: directoryOffset, count: Int(directorySize))
         }
-        return (try entries(directory, count: count), size)
+        return (try entries(directory, count: count, filterForVersionResources: filterForVersionResources), size)
     }
 
-    static func entries(_ data: Data, count: Int64) throws -> [Entry] {
+    private static let payloadPrefixBytes: [UInt8] = Array("Payload/".utf8)
+    private static let infoPlistSuffixBytes: [UInt8] = Array("info.plist".utf8)
+    private static let pngSuffixBytes: [UInt8] = Array(".png".utf8)
+    private static let utcCalendar: Calendar = {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
+        return calendar
+    }()
+
+    private static func isVersionResourceCandidateName(_ slice: Data) -> Bool {
+        guard slice.count > payloadPrefixBytes.count,
+              slice.starts(with: payloadPrefixBytes) else { return false }
+        var slashCount = 0
+        for byte in slice where byte == 0x2F {
+            slashCount += 1
+            if slashCount > 2 { return false }
+        }
+        guard slashCount == 2 else { return false }
+        return hasASCIICaseInsensitiveSuffix(slice, suffix: infoPlistSuffixBytes)
+            || hasASCIICaseInsensitiveSuffix(slice, suffix: pngSuffixBytes)
+    }
+
+    private static func hasASCIICaseInsensitiveSuffix(_ slice: Data, suffix: [UInt8]) -> Bool {
+        guard slice.count >= suffix.count else { return false }
+        let start = slice.index(slice.endIndex, offsetBy: -suffix.count)
+        for (offset, expected) in suffix.enumerated() {
+            let actual = slice[slice.index(start, offsetBy: offset)]
+            let lower = (actual >= 0x41 && actual <= 0x5A) ? (actual + 32) : actual
+            if lower != expected { return false }
+        }
+        return true
+    }
+
+    static func entries(_ data: Data, count: Int64, filterForVersionResources: Bool = false) throws -> [Entry] {
         var result: [Entry] = []
-        result.reserveCapacity(Int(min(count, 200_000)))
+        result.reserveCapacity(filterForVersionResources ? 24 : Int(min(count, 200_000)))
         var position = 0
         while position + 46 <= data.count, data.le32(position) == 0x0201_4b50 {
             let method = data.le16(position + 10)
@@ -203,9 +276,13 @@ enum RemoteZip {
             let extraStart = nameStart + nameLength
             let next = extraStart + extraLength + commentLength
             guard next <= data.count else { throw Failure.unreadable }
-            let nameBytes = data.subdata(in: nameStart..<extraStart)
-            let name = String(data: nameBytes, encoding: .utf8) ?? String(data: nameBytes, encoding: .isoLatin1) ?? ""
-            var modified = dosDateTime(date: dosDate, time: dosTime)
+            let nameSlice = data[nameStart..<extraStart]
+            if filterForVersionResources && !isVersionResourceCandidateName(nameSlice) {
+                position = next
+                continue
+            }
+            let name = String(data: nameSlice, encoding: .utf8) ?? String(data: nameSlice, encoding: .isoLatin1) ?? ""
+            var modified = (!filterForVersionResources || isMainInfoPlist(name)) ? dosDateTime(date: dosDate, time: dosTime) : nil
             var extra = extraStart
             while extra + 4 <= extraStart + extraLength {
                 let id = data.le16(extra), length = Int(data.le16(extra + 2))
@@ -217,7 +294,8 @@ enum RemoteZip {
                     if size == 0xFFFF_FFFF, field + 8 <= body + length { size = Int64(data.le64(field)); field += 8 }
                     if compressed == 0xFFFF_FFFF, field + 8 <= body + length { compressed = Int64(data.le64(field)); field += 8 }
                     if offset == 0xFFFF_FFFF, field + 8 <= body + length { offset = Int64(data.le64(field)) }
-                } else if id == 0x5455, length >= 5, data[data.startIndex + body] & 1 != 0 {
+                } else if id == 0x5455, length >= 5, data[data.startIndex + body] & 1 != 0,
+                          !filterForVersionResources || isMainInfoPlist(name) {
                     modified = Date(timeIntervalSince1970: TimeInterval(Int32(bitPattern: data.le32(body + 1))))
                 }
                 extra = body + length
@@ -272,9 +350,7 @@ enum RemoteZip {
         var parts = DateComponents()
         parts.year = 1980 + Int(date >> 9); parts.month = Int((date >> 5) & 0xF); parts.day = Int(date & 0x1F)
         parts.hour = Int(time >> 11); parts.minute = Int((time >> 5) & 0x3F); parts.second = Int(time & 0x1F) * 2
-        var calendar = Calendar(identifier: .gregorian)
-        calendar.timeZone = TimeZone(secondsFromGMT: 0)!
-        return calendar.date(from: parts)
+        return utcCalendar.date(from: parts)
     }
 }
 
@@ -291,19 +367,80 @@ private extension Data {
     }
 }
 
+/// Lock-free memory + concurrent background PNG decode cache for version icons,
+/// kept outside `VersionMetadataStore` so disk metadata saves and network fetches
+/// never block icon scrolling on the main thread.
+enum VersionIconCache {
+    private actor Requests {
+        var pending: [String: Task<UIImage?, Never>] = [:]
+        func load(_ key: String) async -> UIImage? {
+            if let hit = VersionIconCache.cached(key) { return hit }
+            if let task = pending[key] { return await task.value }
+            let task = Task.detached(priority: .utility) { () -> UIImage? in
+                let url = VersionMetadataStore.iconURL(key)
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                return await VersionIconCache.prepareThumbnail(from: data)
+            }
+            pending[key] = task
+            let image = await task.value
+            if let image { VersionIconCache.store(image, for: key) }
+            pending.removeValue(forKey: key)
+            return image
+        }
+    }
+
+    private static let requests = Requests()
+    /// 24 MiB fits ~300 decoded 144x144px icons while bounding memory cleanly.
+    private static let cache: NSCache<NSString, UIImage> = {
+        let cache = NSCache<NSString, UIImage>()
+        cache.totalCostLimit = 24 * 1024 * 1024
+        return cache
+    }()
+
+    static func cost(of image: UIImage) -> Int {
+        Int(image.size.width * image.scale * image.size.height * image.scale * 4)
+    }
+
+    static func cached(_ key: String) -> UIImage? {
+        cache.object(forKey: key as NSString)
+    }
+
+    static func load(_ key: String) async -> UIImage? {
+        if let hit = cached(key) { return hit }
+        return await requests.load(key)
+    }
+
+    static func store(_ image: UIImage, for key: String) {
+        cache.setObject(image, forKey: key as NSString, cost: cost(of: image))
+    }
+
+    static func remove(_ key: String) {
+        cache.removeObject(forKey: key as NSString)
+    }
+
+    static func removeAll() {
+        cache.removeAllObjects()
+    }
+
+    static func prepareThumbnail(from data: Data) async -> UIImage? {
+        guard let image = UIImage(data: data) else { return nil }
+        if let thumbnail = await image.byPreparingThumbnail(ofSize: CGSize(width: 144, height: 144)) {
+            return thumbnail
+        }
+        return await image.byPreparingForDisplay() ?? image
+    }
+}
+
 /// Version metadata never changes, so lookups are kept on disk. Lookups
 /// run one at a time: each one asks Apple for a download ticket.
 actor VersionMetadataStore {
     static let filename = "version-metadata.json"
+    static let maxConcurrentFetches = 3
     private var cache = LocalResources.load([String: VersionMetadata].self, filename: VersionMetadataStore.filename) ?? [:]
-    private var busy = false
+    private var inFlight = 0
     private var waiters: [(UUID, CheckedContinuation<Void, Error>)] = []
-    private let decodedIcons: NSCache<NSString, UIImage> = {
-        let cache = NSCache<NSString, UIImage>()
-        cache.countLimit = 80
-        cache.totalCostLimit = 8 * 1024 * 1024
-        return cache
-    }()
+    private let diskQueue = DispatchQueue(label: "ipadn.version-metadata.disk", qos: .utility)
+    private var persistTask: Task<Void, Never>?
 
     static func key(platform: AppPlatform, appID: String, versionID: String) -> String {
         "\(platform.rawValue)|\(appID)|\(versionID)"
@@ -316,55 +453,225 @@ actor VersionMetadataStore {
         return found
     }
 
+    func satisfiedCached(_ key: String, requiringPackageSize: Bool = false, requiringIcon: Bool = false) -> VersionMetadata? {
+        guard let value = cache[key],
+              satisfies(value, key: key, size: requiringPackageSize, icon: requiringIcon) else { return nil }
+        return value
+    }
+
     static func iconURL(_ key: String) -> URL {
         let name = SHA256.hash(data: Data(key.utf8)).map { String(format: "%02x", $0) }.joined()
         return LocalResources.support.appendingPathComponent("VersionIcons", isDirectory: true)
             .appendingPathComponent(name + ".png")
     }
     func icon(_ key: String) -> Data? { try? Data(contentsOf: Self.iconURL(key)) }
-    /// File IO and PNG decoding stay on this actor, not the UI executor.
-    func image(_ key: String) -> UIImage? {
-        if let image = decodedIcons.object(forKey: key as NSString) { return image }
-        guard let data = icon(key), let image = UIImage(data: data)?.preparingForDisplay() else { return nil }
-        decodedIcons.setObject(image, forKey: key as NSString,
-                               cost: Int(image.size.width * image.scale * image.size.height * image.scale * 4))
-        return image
+
+    /// Nonisolated so icon decoding never blocks behind metadata JSON writes or network lookups.
+    nonisolated func image(_ key: String) async -> UIImage? {
+        await VersionIconCache.load(key)
     }
 
-    func saveIcon(_ data: Data, key: String) throws {
+    func saveIcon(_ data: Data, key: String) async throws {
         let url = Self.iconURL(key)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try data.write(to: url, options: .atomic)
-        decodedIcons.removeObject(forKey: key as NSString)
+        let queue = diskQueue
+        try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+            queue.async {
+                do {
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try data.write(to: url, options: .atomic)
+                    continuation.resume()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+        VersionIconCache.remove(key)
+        if let prepared = await Task.detached(priority: .utility, operation: { () -> UIImage? in
+            guard let image = UIImage(data: data) else { return nil }
+            let maxPixel = max(image.size.width * image.scale, image.size.height * image.scale)
+            if maxPixel <= 144 {
+                return await image.byPreparingForDisplay() ?? image
+            }
+            return await VersionIconCache.prepareThumbnail(from: data)
+        }).value {
+            VersionIconCache.store(prepared, for: key)
+        }
+    }
+
+    /// Coalesces snapshot writes across bursts so scrolling does not clone and encode
+    /// the full 5,000-entry metadata map after every individual row.
+    private func persistSnapshot() {
+        persistTask?.cancel()
+        persistTask = Task { [weak self] in
+            do { try await Task.sleep(nanoseconds: 600_000_000) } catch { return }
+            await self?.flushSnapshot()
+        }
+    }
+
+    func flushSnapshot() {
+        persistTask?.cancel()
+        persistTask = nil
+        let snapshot = cache
+        diskQueue.async {
+            try? LocalResources.save(snapshot, filename: Self.filename)
+        }
     }
     private func satisfies(_ value: VersionMetadata, key: String, size: Bool, icon: Bool) -> Bool {
-        (!size || value.packageSize != nil) && (!icon || (value.iconAvailable != nil &&
+        let pref = VersionService.versionPreference(value.version)
+        let versionSettled = pref >= 2 || (value.ticketChecked == true && (pref >= 1 || (value.metadataSchema ?? 0) >= VersionMetadata.currentSchema))
+        return versionSettled && (!size || value.packageSize != nil) && (!icon || (value.iconAvailable != nil && !value.hasUnverifiedMissingIcon &&
             (value.iconAvailable != true || FileManager.default.fileExists(atPath: Self.iconURL(key).path))))
     }
 
+    static func versionID(from key: String) -> String? {
+        key.split(separator: "|", maxSplits: 2).last.map(String.init)
+    }
+
+    func upgradeCachedVersion(_ key: String, version: String, replaceDotless: Bool = false) {
+        guard var existing = cache[key] else { return }
+        let rejectingID = Self.versionID(from: key)
+        let incoming = VersionService.sanitizedVersion(version, rejectingID: rejectingID)
+        let incomingScore = VersionService.versionPreference(incoming, rejectingID: rejectingID)
+        let existingScore = VersionService.versionPreference(existing.version, rejectingID: rejectingID)
+        if replaceDotless && incoming == AppVersion.unknown && existingScore <= 1 {
+            cache.removeValue(forKey: key)
+            persistSnapshot()
+            return
+        }
+        let better: String
+        if replaceDotless && existingScore <= 1 && incomingScore >= existingScore {
+            better = incoming
+        } else {
+            better = VersionService.preferredVersion(version, over: existing.version, rejectingID: rejectingID)
+        }
+        guard better != existing.version || (replaceDotless && existing.metadataSchema != VersionMetadata.currentSchema) else { return }
+        if existing.bundleShortVersion == nil,
+           existingScore >= 2,
+           better != existing.version {
+            existing.bundleShortVersion = existing.version
+        }
+        existing.version = better
+        if VersionService.versionPreference(better, rejectingID: rejectingID) >= 2 || replaceDotless {
+            existing.metadataSchema = VersionMetadata.currentSchema
+        }
+        cache[key] = existing
+        persistSnapshot()
+    }
+
+    func clearCache() throws {
+        persistTask?.cancel()
+        persistTask = nil
+        cache.removeAll()
+        VersionIconCache.removeAll()
+        try diskQueue.sync {
+            try LocalResources.save([String: VersionMetadata](), filename: Self.filename)
+            let iconsDir = LocalResources.support.appendingPathComponent("VersionIcons", isDirectory: true)
+            if FileManager.default.fileExists(atPath: iconsDir.path) {
+                try? FileManager.default.removeItem(at: iconsDir)
+            }
+        }
+    }
+
+    private func reconciledCachedHit(for key: String, requiringPackageSize: Bool, requiringIcon: Bool,
+                                     knownVersion: String?,
+                                     allowCached: (VersionMetadata) -> Bool) -> VersionMetadata? {
+        guard var value = cache[key],
+              allowCached(value),
+              satisfies(value, key: key, size: requiringPackageSize, icon: requiringIcon) else { return nil }
+        if let knownVersion {
+            let rejectingID = Self.versionID(from: key)
+            let cleanKnown = VersionService.sanitizedVersion(knownVersion, rejectingID: rejectingID)
+            let knownScore = VersionService.versionPreference(cleanKnown, rejectingID: rejectingID)
+            let cachedScore = VersionService.versionPreference(value.version, rejectingID: rejectingID)
+            if value.bundleShortVersion == nil,
+               (value.metadataSchema ?? 0) < VersionMetadata.currentSchema,
+               knownScore >= 2, cachedScore >= 2, cleanKnown != value.version {
+                // Legacy schema stored `CFBundleShortVersionString` (e.g. 10.0.22) in `version`,
+                // overwriting the public App Store marketing version (e.g. 1.9.5).
+                value.bundleShortVersion = value.version
+                value.version = cleanKnown
+                value.metadataSchema = VersionMetadata.currentSchema
+                cache[key] = value
+                persistSnapshot()
+                return value
+            }
+            let better = VersionService.preferredVersion(knownVersion, over: value.version, rejectingID: rejectingID)
+            if better != value.version {
+                if value.bundleShortVersion == nil, cachedScore >= 2 {
+                    value.bundleShortVersion = value.version
+                }
+                value.version = better
+                cache[key] = value
+                persistSnapshot()
+            }
+        }
+        return value
+    }
+
     func load(_ key: String, requiringPackageSize: Bool = false, requiringIcon: Bool = false,
+              knownVersion: String? = nil,
+              allowCached: @Sendable (VersionMetadata) -> Bool = { _ in true },
               fetch: @Sendable () async throws -> VersionMetadata) async throws -> VersionMetadata {
         // Old records retain their useful version/date, but are refreshed once
-        // when an IPA row also needs its size. Mac metadata need not have one.
-        if let value = cache[key], satisfies(value, key: key, size: requiringPackageSize, icon: requiringIcon) { return value }
+        // when an IPA row also needs its size or a legacy dotless version wasn't checked against ticket metadata.
+        if let hit = reconciledCachedHit(for: key, requiringPackageSize: requiringPackageSize,
+                                         requiringIcon: requiringIcon, knownVersion: knownVersion,
+                                         allowCached: allowCached) {
+            return hit
+        }
         try await acquire()
         defer { release() }
         // A row scrolled away while waiting: skip its request.
         try Task.checkCancellation()
-        if let value = cache[key], satisfies(value, key: key, size: requiringPackageSize, icon: requiringIcon) { return value }
-        let value = try await fetch()
+        if let hit = reconciledCachedHit(for: key, requiringPackageSize: requiringPackageSize,
+                                         requiringIcon: requiringIcon, knownVersion: knownVersion,
+                                         allowCached: allowCached) {
+            return hit
+        }
+        var value = try await fetch()
+        let rejectingID = Self.versionID(from: key)
+        if let knownVersion {
+            let cleanKnown = VersionService.sanitizedVersion(knownVersion, rejectingID: rejectingID)
+            if VersionService.versionPreference(cleanKnown, rejectingID: rejectingID) >= 2 {
+                if value.bundleShortVersion == nil, VersionService.versionPreference(value.version, rejectingID: rejectingID) >= 1 {
+                    value.bundleShortVersion = value.version
+                }
+                value.version = cleanKnown
+            } else {
+                value.version = VersionService.preferredVersion(knownVersion, over: value.version, rejectingID: rejectingID)
+            }
+        }
+        if let previous = cache[key] {
+            if value.bundleShortVersion == nil { value.bundleShortVersion = previous.bundleShortVersion }
+            if value.buildVersion == nil { value.buildVersion = previous.buildVersion }
+            if allowCached(previous) {
+                value.version = VersionService.preferredVersion(value.version, over: previous.version, rejectingID: rejectingID)
+            }
+            if !requiringIcon, value.iconAvailable == nil,
+               previous.iconAvailable == true,
+               FileManager.default.fileExists(atPath: Self.iconURL(key).path) {
+                value.iconAvailable = true
+            }
+        }
         cache[key] = value
         if cache.count > 5_000 { cache.removeAll(); cache[key] = value }
-        try? LocalResources.save(cache, filename: Self.filename)
+        persistSnapshot()
         return value
     }
 
     private func acquire() async throws {
         try Task.checkCancellation()
-        guard busy else { busy = true; return }
+        if inFlight < Self.maxConcurrentFetches {
+            inFlight += 1
+            return
+        }
         let id = UUID()
         try await withTaskCancellationHandler {
             try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                if Task.isCancelled {
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
                 waiters.append((id, continuation))
             }
         } onCancel: {
@@ -376,6 +683,10 @@ actor VersionMetadataStore {
         waiters.remove(at: index).1.resume(throwing: CancellationError())
     }
     private func release() {
-        if waiters.isEmpty { busy = false } else { waiters.removeFirst().1.resume() }
+        if !waiters.isEmpty {
+            waiters.removeFirst().1.resume()
+        } else {
+            inFlight = max(0, inFlight - 1)
+        }
     }
 }

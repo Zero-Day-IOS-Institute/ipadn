@@ -107,7 +107,9 @@ enum PriceComparison {
                 if let country = pending.next() { group.addTask { await regionPrice(appID: appID, country: country) } }
             }
         }
-        return countries.compactMap { results[$0] }
+        var seenCountries = Set<String>()
+        let uniqueCountries = countries.filter { seenCountries.insert($0).inserted }
+        return uniqueCountries.compactMap { results[$0] }
     }
 
     /// Nil when the request failed, rather than showing "not listed".
@@ -435,14 +437,15 @@ enum ReleaseNotesService {
     /// storefronts in order; empty when none could be read.
     @MainActor
     static func notes(appID: String, countries: [String],
-                      language: String = Locale.preferredLanguages.first ?? "en-US") async -> [String: ReleaseNote] {
+                      language: String = Locale.preferredLanguages.first ?? "en-US",
+                      force: Bool = false) async -> [String: ReleaseNote] {
         for country in countries {
             let key = appID + "|" + country + "|" + language
-            if let cached = cache[key] {
+            if !force, let cached = cache[key] {
                 let age = Date().timeIntervalSince(cached.date)
                 if !cached.notes.isEmpty && age < 6 * 3600 { return cached.notes }
-                // A page that couldn't be read (or was redirected) isn't fetched again for a while.
-                if cached.notes.isEmpty && age < 30 * 60 { continue }
+                // A page that couldn't be read (or was redirected) isn't retried immediately.
+                if cached.notes.isEmpty && age < 60 { continue }
             }
             var notes: [String: ReleaseNote] = [:]
             if case .success(let html) = await InAppPriceService.fetchPage(appID: appID, country: country, language: language) {

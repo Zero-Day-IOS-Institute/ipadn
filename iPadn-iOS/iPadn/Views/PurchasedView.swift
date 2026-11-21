@@ -9,7 +9,6 @@ struct PurchasedView: View {
     @State private var query = ""
     @State private var months = 0
     @State private var showLogin = false
-    @State private var getting: StoreApp?
     @State private var headerAway = false
     @State private var selecting = false
     @State private var selection = Set<String>()
@@ -88,6 +87,10 @@ struct PurchasedView: View {
             Section {
                 PageHeader(title: "已购项目") {
                     Menu {
+                        Button("同步完整购买历史", systemImage: "clock.arrow.circlepath") {
+                            Task { await store.refreshOwned(fullHistory: true) }
+                        }
+                        .disabled(store.ownedLoading)
                         Button("找出已下架的应用", systemImage: "archivebox") { findDelisted() }
                             .disabled(store.owned.isEmpty || store.checkingListings)
                         Button("导出为表格", systemImage: "tablecells") { export() }
@@ -119,6 +122,16 @@ struct PurchasedView: View {
                 .listRowBackground(Color.clear).listRowSeparator(.hidden)
                 .listRowInsets(EdgeInsets(top: 4, leading: 0, bottom: 4, trailing: 0))
                 if let error = store.ownedError { Section { InlineIssue(message: error) { Task { await store.refreshOwned() } } } }
+                if let progress = store.ownedHistoryProgress, !store.owned.isEmpty {
+                    Section {
+                        HStack(spacing: 10) {
+                            ProgressView().controlSize(.small)
+                            Text("正在补全历史购买记录（\(progress.done)/\(progress.total)）…")
+                                .font(.footnote)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                }
                 if delistedOnly {
                     Section {
                         HStack(spacing: 12) {
@@ -179,14 +192,14 @@ struct PurchasedView: View {
                                     AppRow(app: storeApp(app), subtitle: subtitle, badge: badges[app.id]) {
                                         // The App Store's re-download glyph leaves room for the
                                         // purchase date in longer languages.
-                                        Image(systemName: "icloud.and.arrow.down")
-                                            .font(.title3.weight(.medium)).foregroundStyle(UX.tint)
-                                            .frame(width: 34, height: 44).contentShape(Rectangle())
-                                            .highPriorityGesture(TapGesture().onEnded { getting = app.storeApp; UX.feedback() })
-                                            .accessibilityElement(children: .ignore)
-                                            .accessibilityAddTraits(.isButton)
-                                            .accessibilityLabel("下载 \(app.name)")
-                                            .accessibilityAction { getting = app.storeApp; UX.feedback() }
+                                        StoreDownloadActionButton(
+                                            app: storeApp(app),
+                                            platformOverride: store.settings.store.platform == .iPadOS ? .iPadOS : .iOS,
+                                            cloudWhenIdle: true,
+                                            insideNavigationLink: true,
+                                            alignment: .center,
+                                            idleAccessibilityLabel: AppText.text("下载 \(app.name)")
+                                        )
                                     }
                                 }
                             }
@@ -216,14 +229,21 @@ struct PurchasedView: View {
                         }
                     }
                 }
+            } else if apple.accounts.contains(where: \.needsReauthentication) {
+                Section {
+                    EmptyState(title: "需要重新登录",
+                               message: "已导入的账号仅包含配置信息，点按下方按钮或前往「账号」页完成登录后即可同步已购项目。",
+                               symbol: "person.crop.circle.badge.exclamationmark",
+                               actionTitle: "前往账号",
+                               action: { store.selectTab(.accounts) })
+                }
             } else {
                 Section { EmptyState(title: "尚未登录", message: "登录后即可查看你获取过的应用。", symbol: "person.crop.circle.badge.checkmark", actionTitle: "登录账号", action: { showLogin = true }) }
             }
         }
         .navigationDestination(isPresented: $showLogin) { LoginView() }
         .sheet(item: $share) { file in ShareSheet(items: [file.url]) }
-        .compatibleNavigationDestination(item: $getting) { app in AppDetailView(app: app, autoStart: true) }
-        .task(id: apple.activeID) { await store.ensureOwnedLoaded() }
+        .task { await store.ensureOwnedLoaded() }
         .toolPage()
         .rootTabBar("已购项目", headerScrolledAway: headerAway)
         .task(id: "\(apple.activeID ?? "")|\(store.ownedRevision)") { await store.loadOwnedArtwork() }

@@ -1,29 +1,70 @@
-## iPadn 2.1.1
+## iPadn 2.3.2
 
-本次为修复与布局优化更新，包含 iOS 16 安装设置崩溃修复和历史版本日期范围筛选排版改进。安装包未签名，请用自己的工具签名后安装。
+**目录 / Contents**：[简体中文](#-核心修复与优化) · [TestFlight 说明与免责](#-testflight-实验性说明与免责声明) · [English](#english) · [TestFlight Notice](#testflight-experimental-notice--disclaimer)
 
-### 修复与优化
+本次为 **v2.3.2** 修复与体验优化版：全面补全**「已购项目」历史与已下架应用**并大幅提升同步速度，解决切换账号后已购应用图标卡在灰色占位的问题，修复 **TestFlight** 登录误报「暂不支持多个受信任号码」与设备身份缓存失效，并修正深色模式下设置页「可更新」标签看不清的对比度问题。安装包均未签名，请使用自用签名工具签名后安装。
 
-- **修复 iOS 16 打开安装设置时崩溃**：对安装帮助链接的中文片段进行显式编码，并避免无效 URL 的强制解包。感谢 #86 的贡献。
-- **完善商店链接容错**：应用详情无法构造有效 App Store 链接时，不再强制解包或显示不可用的查看/分享入口。
-- **优化历史版本日期筛选面板**：将起止日期、查询/取消/清除按钮与状态提示集中展示，统一日期控件对齐和布局间距，并适配无障碍大字体。保留原有日期查询、取消与清除行为。详见 #87。
-- 继续支持 iOS / iPadOS 16 及更新版本，各功能保留各自系统版本要求。
+### 🔧 核心修复与优化
 
-### 两个安装包
+- **完整同步「已购项目」历史记录与已下架应用**
+  - 在原有 DMAP 活跃目录同步的基础上，接入 Apple 完整购买历史接口（`/commerce/account/purchases`，自动处理 pod/cookie 握手、401/403 会话静默刷新与多语言购买日期解析），并与 DMAP 结果智能合并，找回大量历史与已下架应用（含俄区等地区已下架应用）。
+  - 首次全量历史同步改用 **6 路并发** 拉取（并在列表顶部实时显示 `已完成/总年份` 进度），大幅缩短多年账号等待时间；同步完成后自动记录进度，日常刷新仅增量扫描当年记录，几秒即可完成；右上角菜单亦支持随时手动触发「同步完整购买历史」。
+- **修复切换账号后已购列表图标一直加载不出来**
+  - 修复切换 Apple 账号后，后台防抖更新商店地区时误中止 `loadOwnedArtwork()` 拉取任务的竞态问题；改为按账号自身地区与 `地区|AppID` 维度去重、单批拉取量由 20 提升至 50，切号进入「已购」页可稳定补齐全部上架应用图标，并保留已有缓存不闪烁。
+- **修复 TestFlight 登录误报「暂时无法完成验证」与设备槽失效**
+  - 修复过期本地 `iphone` 设备槽缓存触发 `rinfo=67437824` 导致 `no usable iphone identity` 无法继续验证的问题：检测到异常后自动清空过期设备槽并重新向 Apple 申请，仍异常时回退使用新配设备尝试 GSA 登录。
+  - 修复前端错误分类将 `"no usable iphone identity"` 中的 `"iphone"` 误匹配为 `"phone"` 而提示「暂不支持选择多个受信任号码」的 Bug。
+- **修复深色模式下「可更新」标签白底白字看不清**
+  - 修正「账号 › 设置」行右侧更新提示胶囊在深色模式下的前景色（由硬编码白色改为自适应 `UX.onAccent` 配合 `UX.tint`），浅色与深色模式下文字对比度均清晰可辨。
 
-- `iPadn-2.1.1-unsigned.ipa`：标准版，含实时活动和小组件，签名需要 2 个 App ID。
-- `iPadn-2.1.1-lite-unsigned.ipa`：精简版，不含扩展，只需 1 个 App ID；不提供实时活动或小组件，其他功能相同。
+---
+
+### 📢 官方频道与反馈说明
+
+- **官方 Telegram 频道**：👉 [**https://t.me/ipadn_official**](https://t.me/ipadn_official)
+- **GitHub Issues 仅保留只读归档**：新版安装包与源码优先在官方 Telegram 频道发布；使用问题、排障与 Bug 反馈请直接前往频道**对应版本贴文评论区**提交。
+
+### ⚠️ TestFlight 实验性说明与免责声明
+
+- **实验性功能提醒**：TestFlight 下载与原生安装为 `v2.3.x` 系列推出的**实验性功能**，受 Apple 服务端策略、账号当前有效 Beta 资格、本地网络/代理与本机配对影响，建议先使用备用 Apple 账号体验，勿分享配对文件、令牌或完整备份；详细用法与排障指南见 [README — TestFlight 实验性新功能](README.md#testflight-实验性新功能)。
+- **免责声明**：iPadn 基于 [GPL-2.0-or-later](LICENSE) 开源，仅限个人合法备份、授权测试与技术研究，与 Apple Inc. 无关；因使用本工具带来的账号风控或数据风险由使用者自行承担。
+
+### 📦 安装包与签名源
+
+- `iPadn-2.3.2-unsigned.ipa`：标准版，含实时活动（灵动岛、锁屏进度）与桌面小组件扩展，签名需要 2 个 App ID。
+- `iPadn-2.3.2-lite-unsigned.ipa`：精简版，移除扩展，只需 1 个 App ID；不提供实时活动或小组件，其他功能完全一致。
 - SideStore、AltStore、Feather 等签名工具可添加源：`https://raw.githubusercontent.com/mengangs/ipadn/main/altstore-source.json`。
+
+---
 
 ### English
 
-This maintenance update fixes a crash when opening Installation settings on iOS 16 and improves the version-history date-range filter layout.
+**v2.3.2** is a targeted fix and quality-of-life update: it recovers missing historical & delisted apps in **Purchased** with fast concurrent syncing, fixes purchased app icons getting stuck on gray placeholders after switching accounts, resolves a false **TestFlight** "multiple trusted phone numbers" verification error & stale device slot deadlock, and fixes Dark Mode contrast on the Settings update badge. Both packages are unsigned—sign with your own tool before installing.
 
-- Encode the installation-help URL fragment explicitly for iOS 16 and remove unsafe URL force-unwrapping (#86).
-- Safely omit App Store viewing/sharing controls when a valid store link cannot be constructed.
-- Group date-range fields, query/cancel/clear actions and status in one panel, with aligned controls, consistent spacing and an adaptive accessibility layout (#87). Existing query behavior is unchanged.
-- iOS / iPadOS 16 and later remain supported, subject to each feature's requirements.
+#### Fixes & Improvements Since v2.3.1
 
-Both packages are unsigned: the standard package includes Live Activities/widgets and needs two App IDs; lite has no extension and needs one. Sign with your own tool before installing.
+- **Complete Purchase History & Delisted App Recovery**
+  - Complements the fast DMAP active-catalog sync with Apple's full `/commerce/account/purchases` purchase history endpoint (supporting pod/cookie handshakes, automatic 401/403 silent session refresh, and multi-locale purchase dates), merging both sources so older and delisted apps appear reliably alongside active ones.
+  - Uses **6 concurrent workers** with inline year-by-year progress for the initial full-history backfill, then persists sync state so subsequent refreshes only scan the current year incrementally in a few seconds; a **Sync Full Purchase History** option is also available in the top-right menu.
+- **Fixed Purchased List Icons Staying Gray After Account Switch**
+  - Eliminated a race condition where the debounced storefront-country sync aborted `loadOwnedArtwork()` right after switching accounts, scoped deduplication per storefront (`country|appId`), raised batch size from 20 to 50, and preserved cached icon URLs across history merges.
+- **Fixed TestFlight False "Multiple Trusted Phone Numbers" Error & Device Provisioning**
+  - Automatically wipes and re-provisions stale cached `iphone` device slots returning `rinfo=67437824` (with fallback to the freshly provisioned device instead of deadlocking locally).
+  - Tightened multi-phone error classification so `"no usable iphone identity"` no longer falsely matches `"phone"`.
+- **Fixed Dark Mode Update Badge Contrast**
+  - Updated the Settings row update pill on the Account tab from hardcoded white text to `UX.onAccent` on `UX.tint`, keeping it crisp and readable in both Light and Dark Mode.
+
+#### Official Telegram Channel & GitHub Issues Archive
+- **Official Telegram Channel**: [**https://t.me/ipadn_official**](https://t.me/ipadn_official) (new builds & source archives land here first).
+- **GitHub Issues Read-Only**: Please post support questions, TestFlight diagnostics, and bug reports under the matching release post in our Telegram channel.
+
+#### TestFlight Experimental Notice & Disclaimer
+- TestFlight download and native installation in `v2.3.x` are **experimental** and depend on Apple server behavior, active per-account invitations, proxy/DNS setup, and device pairing state. Testing with a secondary Apple Account first is recommended, and never share pairing files, tokens, or unencrypted backups (see [README_EN — TestFlight Experimental](README_EN.md#testflight-experimental)).
+- Released under [GPL-2.0-or-later](LICENSE) for authorized personal testing, backups, and research; unaffiliated with Apple Inc., with all account or data risks assumed by the user.
+
+#### Packages
+- `iPadn-2.3.2-unsigned.ipa`: Standard build with Live Activities & Widgets (requires 2 App IDs).
+- `iPadn-2.3.2-lite-unsigned.ipa`: Lite build without extensions (requires 1 App ID; identical core features).
+- AltStore / SideStore / Feather repo: `https://raw.githubusercontent.com/mengangs/ipadn/main/altstore-source.json`.
 
 更早版本的更新内容见 [Releases](https://github.com/mengangs/ipadn/releases)。
