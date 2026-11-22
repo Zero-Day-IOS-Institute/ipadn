@@ -164,10 +164,24 @@ struct PackageSourceDetailView: View {
                     Text(verbatim: name)
                         .font(.title3.weight(.semibold))
                         .multilineTextAlignment(.center)
-                    if !subtitleText.isEmpty {
-                        Text(verbatim: subtitleText)
-                            .font(.subheadline.monospacedDigit())
-                            .foregroundStyle(.secondary)
+                    let isTF: Bool = {
+                        #if canImport(TestFlightKit)
+                        return tfItem != nil || url?.path.contains("/TestFlight/") == true
+                        #else
+                        return false
+                        #endif
+                    }()
+                    if isTF || !subtitleText.isEmpty {
+                        HStack(spacing: 5) {
+                            if isTF {
+                                TestFlightIcon(size: 14)
+                            }
+                            if !subtitleText.isEmpty {
+                                Text(verbatim: subtitleText)
+                                    .font(.subheadline.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
                     }
                 }
                 if exists, let url {
@@ -255,6 +269,7 @@ struct PackageSourceDetailView: View {
             if let checked = ui.detections[url]?.checkedAt {
                 LabeledContent("检测时间", value: checked.formatted(date: .abbreviated, time: .shortened))
             }
+            PackageBuildInfoRows(file: url)
             if let detection = ui.detections[url] {
                 DisclosureGroup("检测详情") {
                     if let note = detection.note {
@@ -306,19 +321,25 @@ struct PackageSourceDetailView: View {
             do {
                 if let job {
                     _ = try await manager.removeBatch([job.id])
+                    ui.markFilesChanged()
+                    store.infoMessage = AppText.text("已删除原始 IPA")
                 } else if let url {
                     #if canImport(TestFlightKit)
                     if let tfItem = TFProductIndex.shared.item(forFile: url) {
                         TFProductIndex.shared.delete(tfItem)
+                        ui.markFilesChanged()
+                        store.infoMessage = AppText.text("已删除原始 IPA")
                     } else {
                         try FileManager.default.removeItem(at: url)
+                        ui.markFilesChanged()
+                        store.infoMessage = AppText.text("已删除原始 IPA")
                     }
                     #else
                     try FileManager.default.removeItem(at: url)
+                    ui.markFilesChanged()
+                    store.infoMessage = AppText.text("已删除原始 IPA")
                     #endif
                 }
-                ui.markFilesChanged()
-                store.infoMessage = AppText.text("已删除原始 IPA")
                 dismiss()
             } catch { store.errorMessage = error.localizedDescription }
         }

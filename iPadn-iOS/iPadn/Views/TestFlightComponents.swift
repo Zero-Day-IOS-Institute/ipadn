@@ -91,35 +91,16 @@ struct TFAppIconView: View {
                 loaded = (currentKey, image)
             }
         }
+        .onDisappear { loaded = nil }
     }
 
-    @ViewBuilder
     private var placeholderView: some View {
-        let palette = resolvedPalette
         ZStack {
-            if palette.colors.count >= 2 {
-                LinearGradient(colors: palette.colors, startPoint: .topLeading, endPoint: .bottomTrailing)
-            } else if let single = palette.colors.first {
-                LinearGradient(colors: [single, single.opacity(0.82)], startPoint: .topLeading, endPoint: .bottomTrailing)
-            } else {
-                Color(.tertiarySystemFill)
-            }
-            if let initial = monogram {
-                Text(verbatim: initial)
-                    .font(.system(size: size * 0.42, weight: .bold, design: .rounded))
-                    .foregroundStyle(palette.foreground)
-            } else {
-                Image(systemName: "airplane")
-                    .font(.system(size: size * 0.36, weight: .medium))
-                    .foregroundStyle(palette.foreground)
-            }
+            Color(.tertiarySystemFill)
+            Image(systemName: "app.fill")
+                .font(.system(size: size * 0.4))
+                .foregroundStyle(.quaternary)
         }
-    }
-
-    private var monogram: String? {
-        let trimmed = appName.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let first = trimmed.first else { return nil }
-        return String(first).uppercased()
     }
 
     private var iconBackdropColor: Color {
@@ -127,35 +108,6 @@ struct TFAppIconView: View {
             return parsed
         }
         return Color(.secondarySystemGroupedBackground)
-    }
-
-    private var resolvedPalette: (colors: [Color], foreground: Color) {
-        var parsed: [(Color, Double)] = []
-        if let gradient = colors?.gradientHexes, !gradient.isEmpty {
-            parsed = gradient.compactMap(Self.parseHexColor)
-        }
-        if parsed.isEmpty, let bg = colors?.bgHex, let item = Self.parseHexColor(bg) {
-            parsed = [item]
-        }
-        guard !parsed.isEmpty else {
-            // Deterministic soft slate gradient when an app has no icon or color palette
-            // (e.g. retired TestFlight builds removed from Apple's servers).
-            let seed = abs(appName.unicodeScalars.reduce(0) { ($0 &* 31) &+ Int($1.value) })
-            let palettes: [[Color]] = [
-                [Color(.sRGB, red: 0.36, green: 0.42, blue: 0.52, opacity: 1),
-                 Color(.sRGB, red: 0.24, green: 0.28, blue: 0.37, opacity: 1)],
-                [Color(.sRGB, red: 0.33, green: 0.46, blue: 0.50, opacity: 1),
-                 Color(.sRGB, red: 0.22, green: 0.32, blue: 0.36, opacity: 1)],
-                [Color(.sRGB, red: 0.43, green: 0.39, blue: 0.52, opacity: 1),
-                 Color(.sRGB, red: 0.29, green: 0.26, blue: 0.38, opacity: 1)],
-                [Color(.sRGB, red: 0.40, green: 0.43, blue: 0.47, opacity: 1),
-                 Color(.sRGB, red: 0.27, green: 0.29, blue: 0.33, opacity: 1)],
-            ]
-            return (palettes[seed % palettes.count], Color.white.opacity(0.92))
-        }
-        let avgLuminance = parsed.map(\.1).reduce(0, +) / Double(parsed.count)
-        let foreground: Color = avgLuminance > 0.62 ? Color.black.opacity(0.78) : Color.white
-        return (parsed.map(\.0), foreground)
     }
 
     static func heroGradientColors(from colors: TFIconColors?) -> [Color] {
@@ -228,9 +180,9 @@ struct TFHeroAmbientBackground: View {
                     }
                     LinearGradient(
                         colors: [
-                            Color.black.opacity(0.24),
-                            Color.black.opacity(0.42),
-                            Color.black.opacity(0.58),
+                            Color.black.opacity(0.36),
+                            Color.black.opacity(0.48),
+                            Color.black.opacity(0.64),
                         ],
                         startPoint: .top,
                         endPoint: .bottom
@@ -254,16 +206,41 @@ struct TFHeroAmbientBackground: View {
 
 struct TFVerificationSheet: View {
     let accountDisplay: String
+    let channel: TFLogin.VerificationChannel
     @Binding var code: String
     let isSubmitting: Bool
     let onSubmit: () -> Void
     let onCancel: () -> Void
 
+    private var isSMS: Bool {
+        if case .sms = channel { return true }
+        return false
+    }
+
+    private var promptText: String {
+        switch channel {
+        case .trustedDevice:
+            return AppText.text("Apple 已向 \(accountDisplay) 的受信任设备发送登录请求，请在设备上点按「允许」并输入 6 位验证码。")
+        case let .sms(phoneDisplay):
+            if let phoneDisplay, !phoneDisplay.isEmpty {
+                return AppText.text("Apple 已向 \(phoneDisplay) 发送 6 位短信验证码，请等待本次最新短信送达后输入。")
+            }
+            return AppText.text("Apple 已向 \(accountDisplay) 的受信任手机号发送 6 位短信验证码，请等待本次最新短信送达后输入。")
+        }
+    }
+
+    private var tipText: String {
+        if isSMS {
+            return AppText.text("请勿填入之前收到的旧短信验证码；如暂未收到短信，可稍候几秒或取消后重新尝试。")
+        }
+        return AppText.text("若未收到受信任设备弹窗，请在已登录该账号的设备上前往「设置 › Apple 账户 › 登录与安全 › 获取验证码」，输入显示的 6 位验证码即可。")
+    }
+
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 18) {
-                    Image(systemName: "lock.shield.fill")
+                    Image(systemName: isSMS ? "message.badge.filled.fill" : "lock.shield.fill")
                         .font(.system(size: 52))
                         .foregroundStyle(.tint)
                         .padding(.top, 8)
@@ -272,7 +249,7 @@ struct TFVerificationSheet: View {
                     Text("双重认证")
                         .font(.title2.weight(.bold))
 
-                    Text("Apple 已向 \(accountDisplay) 的受信任设备发送登录请求，请在设备上点按「允许」并输入 6 位验证码。")
+                    Text(verbatim: promptText)
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)
@@ -303,12 +280,11 @@ struct TFVerificationSheet: View {
                     .accessibilityLabel(Text("提交验证码"))
                     .accessibilityIdentifier("tf.verification.submit")
 
-                    // Multi-number / SMS selection fallback hint so users never get stuck silently.
                     HStack(alignment: .top, spacing: 8) {
                         Image(systemName: "info.circle")
                             .foregroundStyle(.secondary)
                             .padding(.top, 2)
-                        Text("若账号绑定了多个受信任号码或未收到弹窗，暂不支持在此选择号码；请在已登录该账号的设备上前往「设置 › Apple 账户 › 登录与安全 › 获取验证码」，输入显示的 6 位验证码即可。")
+                        Text(verbatim: tipText)
                             .font(.footnote)
                             .foregroundStyle(.secondary)
                             .fixedSize(horizontal: false, vertical: true)
@@ -329,6 +305,60 @@ struct TFVerificationSheet: View {
                 }
             }
         }
+        .interactiveDismissDisabled()
+        .presentationDetents([.medium, .large])
+    }
+}
+
+// MARK: - Multi-Phone SMS Selection Sheet
+
+struct TFPhoneSelectionSheet: View {
+    let accountDisplay: String
+    let phones: [TFLogin.TrustedPhone]
+    let onSelect: (TFLogin.TrustedPhone) -> Void
+    let onCancel: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    ForEach(phones) { phone in
+                        Button {
+                            onSelect(phone)
+                        } label: {
+                            HStack(spacing: 12) {
+                                Image(systemName: "message.fill")
+                                    .foregroundStyle(.tint)
+                                    .frame(width: 24)
+                                Text(verbatim: phone.displayNumber.isEmpty ? "#\(phone.id)" : phone.displayNumber)
+                                    .font(.body.monospacedDigit())
+                                    .foregroundStyle(.primary)
+                                Spacer()
+                                Image(systemName: "chevron.forward")
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.tertiary)
+                            }
+                            .contentShape(Rectangle())
+                        }
+                        .buttonStyle(.plain)
+                    }
+                } header: {
+                    Text("选择受信任手机号")
+                } footer: {
+                    Text("Apple 将向所选号码为 \(accountDisplay) 发送 6 位短信验证码。")
+                }
+            }
+            .toolPage()
+            .navigationTitle("短信验证")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("取消", action: onCancel)
+                        .accessibilityLabel(Text("取消"))
+                }
+            }
+        }
+        .interactiveDismissDisabled()
         .presentationDetents([.medium, .large])
     }
 }
@@ -508,6 +538,7 @@ struct TFInstallSheet: View {
                                 .font(.headline)
                                 .lineLimit(2)
                             HStack(spacing: 6) {
+                                TestFlightIcon(size: 13)
                                 if let version = app.latestVersion, !version.isEmpty {
                                     Text(verbatim: "v\(version)")
                                 }
@@ -515,12 +546,6 @@ struct TFInstallSheet: View {
                             }
                             .font(.caption)
                             .foregroundStyle(.secondary)
-                            HStack(spacing: 6) {
-                                TagBadge(text: "TestFlight", tint: .secondary)
-                                if isInstalled {
-                                    TagBadge(text: "已安装", tint: .green)
-                                }
-                            }
                         }
                     }
                     .padding(.vertical, 4)
@@ -649,14 +674,9 @@ struct TFInstallSheet: View {
             } message: {
                 Text(verbatim: decryptError ?? "")
             }
-            .confirmationDialog("删除本地安装包？", isPresented: $confirmingDelete, titleVisibility: .visible) {
-                Button("删除本地安装包", role: .destructive) {
-                    onDelete()
-                    dismiss()
-                }
-                Button("取消", role: .cancel) {}
-            } message: {
-                Text("仅删除本机缓存的安装包文件，之后可随时重新下载。")
+            .actionConfirmation(isPresented: $confirmingDelete, title: "删除本地安装包？", message: "仅删除本机缓存的安装包文件，之后可随时重新下载。", confirmTitle: "删除本地安装包") {
+                onDelete()
+                dismiss()
             }
         }
         .presentationDetents([.medium, .large])
@@ -924,14 +944,9 @@ struct TFAccountSheet: View {
                     Button("完成") { dismiss() }
                 }
             }
-            .confirmationDialog("清除当前 TestFlight 会话？", isPresented: $confirmingSignOut, titleVisibility: .visible) {
-                Button("清除会话", role: .destructive) {
-                    model.clearPersistedSession(storeAccountDsid: selectedAppleAccount?.dsid ?? "")
-                    dismiss()
-                }
-                Button("取消", role: .cancel) {}
-            } message: {
-                Text("下次使用此账号访问 TestFlight 时需要重新验证；已下载的安装包会保留。")
+            .actionConfirmation(isPresented: $confirmingSignOut, title: "清除当前 TestFlight 会话？", message: "下次使用此账号访问 TestFlight 时需要重新验证；已下载的安装包会保留。", confirmTitle: "清除会话") {
+                model.clearPersistedSession(storeAccountDsid: selectedAppleAccount?.dsid ?? "")
+                dismiss()
             }
         }
         .presentationDetents([.large])
@@ -991,7 +1006,7 @@ struct TFDiagnosticsContent: View {
             if let diagnosis = model.networkDiagnosis {
                 Section("网络异常说明") {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text(verbatim: diagnosis.summary)
+                        Text(verbatim: AppText.text("无法连接 Apple 服务（gsa / testflight）。请检查代理规则是否拦截 *.apple.com，或在设置中把 TF 网络模式改为「强制直连」"))
                             .font(.footnote)
                             .foregroundStyle(.red)
                             .fixedSize(horizontal: false, vertical: true)
@@ -1017,12 +1032,12 @@ struct TFDiagnosticsContent: View {
                     if !model.dsidTail.isEmpty {
                         diagRow("DSID", "…" + model.dsidTail)
                     }
-                    diagRow("DNS 路径", model.dnsPathSummary)
+                    diagRow("DNS 路径", Self.localizedDNSPath(model.dnsPathSummary))
                     diagRow("HTTP", probe.status.map { "\($0) · \(probe.bytes) B" } ?? (probe.failure ?? AppText.text("无响应")))
                     diagRow("fake-IP", probe.fakeIP != nil ? AppText.text("命中代理假地址") : AppText.text("未命中"))
-                    diagRow("判定", probe.verdict)
-                    if let advice = probe.advice {
-                        Text(verbatim: advice)
+                    diagRow("判定", Self.localizedVerdict(probe))
+                    if !probe.reachable {
+                        Text(verbatim: AppText.text("GSA 不可达：疑似代理/VPN 拦截，请关闭手机上的 VPN 或在代理里放行 gsa.apple.com。"))
                             .font(.footnote)
                             .foregroundStyle(.orange)
                     }
@@ -1042,7 +1057,8 @@ struct TFDiagnosticsContent: View {
                     .padding(.vertical, 2)
                     Button {
                         #if canImport(UIKit)
-                        UIPasteboard.general.string = model.lines.joined(separator: "\n")
+                        let text = model.lines.joined(separator: "\n")
+                        UIPasteboard.general.setItems([[UIPasteboard.typeAutomatic: text]], options: [.localOnly: true])
                         #endif
                         copied = true
                         UX.feedback()
@@ -1079,6 +1095,26 @@ struct TFDiagnosticsContent: View {
         case .direct: return AppText.text("强制直连")
         case .proxy: return AppText.text("强制代理")
         }
+    }
+
+    private static func localizedDNSPath(_ raw: String) -> String {
+        raw.replacingOccurrences(of: "系统 DNS", with: AppText.text("系统 DNS"))
+    }
+
+    private static func localizedVerdict(_ probe: TFGSAProbe) -> String {
+        if probe.fakeIP != nil {
+            return AppText.text("被代理接管（命中 fake-IP）")
+        }
+        if probe.reachable {
+            return probe.status == 404
+                ? AppText.text("网络正常；裸 GET 404 属正常（需要 Store UA）")
+                : AppText.text("网络正常")
+        }
+        if probe.status == nil {
+            let reason = probe.failure ?? AppText.text("连接失败")
+            return AppText.text("无 HTTP 响应（\(reason)）")
+        }
+        return AppText.text("网络异常")
     }
 }
 

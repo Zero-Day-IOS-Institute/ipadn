@@ -15,6 +15,7 @@ struct TestFlightDetailView: View {
     let app: TFBetaApp
     @ObservedObject var model: TFHomeModel
     @EnvironmentObject private var store: ToolStore
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var expandWhatsNew = false
     @State private var expandDescription = false
@@ -25,10 +26,10 @@ struct TestFlightDetailView: View {
     @State private var heroCollapsed = false
     @State private var copiedBundleID = false
     @State private var cachedPackageBytes: Int64 = 0
+    @State private var quickBuildInfo: QuickBuildInfo?
 
     private var detail: TFAppDetail? { model.details[app.id] }
     private var rowState: TFRowState { model.rowState(app) }
-    private var isInstalled: Bool { model.installedAppIDs.contains(app.id) }
     private var isInstalling: Bool { model.installingAppIDs.contains(app.id) }
     private var iconColors: TFIconColors? { model.iconColors[app.id] ?? detail?.iconAsset?.colors }
 
@@ -162,6 +163,7 @@ struct TestFlightDetailView: View {
         .navigationTitle("")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarBackground(.hidden, for: .navigationBar)
+        .toolbarColorScheme(heroCollapsed ? nil : .dark, for: .navigationBar)
         .toolbar {
             if let inviteLinkURL {
                 ToolbarItem(placement: .compatibleTopBarTrailing) {
@@ -176,34 +178,30 @@ struct TestFlightDetailView: View {
             await model.ensureDetailLoaded(for: app)
         }
         .task(id: rowState.output) {
-            guard let url = rowState.output else { cachedPackageBytes = 0; return }
-            let size = await Task.detached(priority: .utility) { Int64(url.fileSizeBytes) }.value
-            if !Task.isCancelled { cachedPackageBytes = size }
+            guard let url = rowState.output else {
+                cachedPackageBytes = 0
+                quickBuildInfo = nil
+                return
+            }
+            let (size, build) = await Task.detached(priority: .utility) {
+                (Int64(url.fileSizeBytes), PackageInfoService.quickBuildInfo(url))
+            }.value
+            if !Task.isCancelled {
+                cachedPackageBytes = size
+                quickBuildInfo = build
+            }
         }
         .sheet(isPresented: $showingInstallSheet) {
             if let packageURL = model.productURL(for: app) {
-                TFInstallSheet(
-                    app: app,
-                    packageURL: packageURL,
-                    iconURL: model.iconFiles[app.id],
-                    iconColors: iconColors,
-                    iconRevision: model.iconRevisions[app.id] ?? 0,
-                    installation: store.installation,
-                    isInstalling: isInstalling,
-                    isInstalled: isInstalled,
-                    installNote: model.installNotes[app.id],
-                    installFailed: model.installFailedAppIDs.contains(app.id),
-                    needsChannelGuide: model.installNeedsChannelAppIDs.contains(app.id),
-                    onInstall: { method in
-                        model.install(app, method: method, installation: store.installation)
-                    },
-                    onDelete: {
-                        model.deleteLocalProduct(app)
-                    },
-                    onOpenSettings: {
-                        store.accountNav.push(.installation)
-                    }
+                PackageInstallationView(
+                    job: model.makeInstallJob(for: app, packageURL: packageURL),
+                    packageFileURL: packageURL,
+                    packageIconURL: model.iconFiles[app.id],
+                    isTestFlight: true
                 )
+                .sheetNotice()
+                .environmentObject(store)
+                .environmentObject(store.downloads)
             }
         }
         .sheet(item: $sharedFile) { item in
@@ -246,20 +244,17 @@ struct TestFlightDetailView: View {
                             .font(.caption.monospacedDigit())
                             .foregroundStyle(.white.opacity(0.82))
                             .multilineTextAlignment(.center)
+                            .id(statusLine)
+                            .transition(.statusSwap(reduceMotion: reduceMotion))
                     }
                 }
                 .padding(.horizontal, 24)
+                .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.86), value: heroStatusLine)
 
                 if availability == .testing {
                     heroPrimaryAction
                         .padding(.horizontal, 36)
                         .padding(.top, 4)
-
-                    if rowState.stage == .downloading {
-                        ProgressView(value: rowState.fraction)
-                            .tint(.white)
-                            .padding(.horizontal, 48)
-                    }
                 }
             }
             .padding(.top, 112)
@@ -299,19 +294,12 @@ struct TestFlightDetailView: View {
 
     private var heroStatusLine: String? {
         switch rowState.stage {
-        case .idle:
+        case .idle, .resolving, .installing, .downloading, .verifying:
             return nil
-        case .resolving:
-            return AppText.text("读取构建信息…")
-        case .installing:
-            return AppText.text("准备下载…")
-        case .downloading:
-            return "\(byteText(rowState.received)) / \(byteText(rowState.total)) · \(Int(rowState.fraction * 100))%"
-        case .verifying:
-            return AppText.text("校验安装包…")
+        case .paused:
+            return AppText.text("已暂停")
         case .done:
             if isInstalling, let note = model.installNotes[app.id] { return note }
-            if isInstalled { return AppText.text("已安装") }
             let size = cachedPackageBytes > 0 ? cachedPackageBytes : (detail?.fileSizeBytes ?? 0)
             if size > 0 {
                 return "\(byteText(size)) · \(AppText.text("已下载"))"
@@ -324,58 +312,113 @@ struct TestFlightDetailView: View {
 
     @ViewBuilder
     private var heroPrimaryAction: some View {
-        switch rowState.stage {
-        case .idle:
-            heroPillButton(title: AppText.text("获取"), busy: false, enabled: model.isSignedIn) {
-                model.start(app)
+        let config: (title: String, busy: Bool, progress: Double?, enabled: Bool) = {
+            switch rowState.stage {
+            case .idle:
+                return (AppText.text("获取"), false, nil, model.isSignedIn)
+            case .resolving, .installing:
+                return (AppText.text("取消"), true, nil, true)
+            case .downloading:
+                return (
+                    AppText.text("暂停"),
+                    rowState.total <= 0,
+                    rowState.total > 0 ? rowState.fraction : nil,
+                    true
+                )
+            case .paused:
+                return (AppText.text("继续"), false, nil, true)
+            case .verifying:
+                return (AppText.text("校验安装包…"), true, nil, false)
+            case .done:
+                return (isInstalling ? AppText.text("正在处理…") : AppText.text("安装"), isInstalling, nil, true)
+            case .failed:
+                return (AppText.text("重试"), false, nil, model.isSignedIn)
             }
-        case .resolving, .installing, .downloading:
-            heroPillButton(title: AppText.text("取消"), busy: true, enabled: true) {
+        }()
+        heroPillButton(
+            title: config.title,
+            busy: config.busy,
+            progress: config.progress,
+            enabled: config.enabled
+        ) {
+            switch rowState.stage {
+            case .idle, .failed:
+                model.start(app)
+            case .resolving, .installing:
                 model.cancel(app)
-            }
-        case .verifying:
-            heroPillButton(title: AppText.text("校验安装包…"), busy: true, enabled: false) {}
-        case .done:
-            heroPillButton(
-                title: isInstalling ? AppText.text("正在处理…") : AppText.text("安装"),
-                busy: isInstalling,
-                enabled: true
-            ) {
+            case .downloading:
+                model.pause(app)
+            case .paused:
+                model.resume(app)
+            case .verifying:
+                break
+            case .done:
                 showingInstallSheet = true
-            }
-        case .failed:
-            heroPillButton(title: AppText.text("重试"), busy: false, enabled: model.isSignedIn) {
-                model.start(app)
             }
         }
     }
 
-    private func heroPillButton(title: String, busy: Bool, enabled: Bool, action: @escaping () -> Void) -> some View {
-        let prominent = enabled && !busy
+    private func heroPillButton(title: String, busy: Bool, progress: Double? = nil, enabled: Bool, action: @escaping () -> Void) -> some View {
+        let prominent = enabled && !busy && progress == nil
+        let hasProgress = progress != nil
         return Button {
             UX.tapLight()
             action()
         } label: {
             HStack(spacing: 8) {
-                if busy {
+                if let progress {
+                    ZStack {
+                        Circle()
+                            .stroke(.white.opacity(0.28), lineWidth: 2.4)
+                        Circle()
+                            .trim(from: 0, to: max(0.02, min(1, progress)))
+                            .stroke(.white, style: StrokeStyle(lineWidth: 2.4, lineCap: .round))
+                            .rotationEffect(.degrees(-90))
+                            .animation(reduceMotion ? nil : .linear(duration: 0.25), value: progress)
+                        RoundedRectangle(cornerRadius: 1.8, style: .continuous)
+                            .fill(.white)
+                            .frame(width: 7, height: 7)
+                    }
+                    .frame(width: 22, height: 22)
+                    .transition(reduceMotion ? .opacity : .scale(scale: 0.72).combined(with: .opacity))
+                } else if busy {
                     ProgressView()
                         .tint(.white)
+                        .transition(reduceMotion ? .opacity : .scale(scale: 0.72).combined(with: .opacity))
                 }
                 Text(verbatim: title)
                     .font(.body.weight(.semibold))
                     .foregroundStyle(prominent ? Color.black : Color.white)
+                    .contentTransition(.opacity)
             }
             .frame(maxWidth: .infinity)
             .frame(minHeight: 46)
-            .background(
-                prominent ? Color.white.opacity(0.94) : Color.white.opacity(enabled ? 0.22 : 0.12),
-                in: Capsule()
-            )
+            .background {
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(prominent ? Color.white.opacity(0.94) : Color.white.opacity(enabled ? 0.22 : 0.12))
+                    if let progress {
+                        GeometryReader { geo in
+                            Capsule()
+                                .fill(.white.opacity(0.18))
+                                .frame(width: max(0, geo.size.width * min(1, max(0, progress))))
+                                .animation(reduceMotion ? nil : .linear(duration: 0.25), value: progress)
+                        }
+                        .clipShape(Capsule())
+                        .transition(.opacity)
+                    }
+                }
+            }
             .overlay(Capsule().stroke(.white.opacity(prominent ? 0.35 : 0.24), lineWidth: 0.5))
+            .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.86), value: prominent)
+            .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.86), value: busy)
+            .animation(reduceMotion ? nil : .spring(response: 0.32, dampingFraction: 0.86), value: hasProgress)
+            .animation(reduceMotion ? nil : .easeInOut(duration: 0.18), value: title)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PillButtonPressStyle(scale: 0.96, opacity: 0.86))
         .disabled(!enabled)
         .accessibilityLabel(Text(verbatim: title))
+        .accessibilityValue(progress.map { "\(Int(($0 * 100).rounded()))%" } ?? "")
     }
 
     // MARK: - 3-Column Info Strip
@@ -460,6 +503,31 @@ struct TestFlightDetailView: View {
                         Text(verbatim: byteText(cachedPackageBytes > 0 ? cachedPackageBytes : (detail?.fileSizeBytes ?? 0)))
                             .font(.subheadline)
                             .foregroundStyle(.secondary)
+                        Image(systemName: "chevron.forward")
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(.horizontal, 16)
+                    .frame(minHeight: 48)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                Divider().padding(.leading, 16)
+
+                NavigationLink {
+                    PackageInfoView(file: packageURL)
+                } label: {
+                    HStack(spacing: 10) {
+                        Label("安装包信息", systemImage: "info.circle")
+                        Spacer(minLength: 8)
+                        if let summary = quickBuildInfo?.compactLabel, !summary.isEmpty {
+                            Text(verbatim: summary)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                                .minimumScaleFactor(0.8)
+                        }
                         Image(systemName: "chevron.forward")
                             .font(.caption.weight(.semibold))
                             .foregroundStyle(.tertiary)
@@ -562,7 +630,7 @@ struct TestFlightDetailView: View {
                 }
                 if let devices = detail?.supportedDevices, !devices.isEmpty {
                     Divider().padding(.leading, 16)
-                    infoRow("支持设备", devices.joined(separator: "、"))
+                    infoRow("支持设备", ListFormatter.localizedString(byJoining: devices))
                 }
                 if let size = detail?.fileSizeBytes, size > 0 {
                     Divider().padding(.leading, 16)
@@ -609,7 +677,7 @@ struct TestFlightDetailView: View {
                             Spacer(minLength: 12)
                             Text("查看")
                                 .font(.subheadline)
-                            Image(systemName: "arrow.up.right")
+                            Image(systemName: "arrow.up.forward")
                                 .font(.caption)
                         }
                         .padding(.horizontal, 16)
